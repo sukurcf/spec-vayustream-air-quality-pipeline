@@ -10,8 +10,8 @@ Use STAR.
 |---|---|
 | Situation | Indian city air-quality teams need faster signals than daily reports. Raw sensor data has duplicates, bad values, late events, and gaps. |
 | Task | I built VayuStream, a local streaming pipeline for indicative 15-minute AQI and repeat-safe alerts. |
-| Action | I used Kafka 4, PySpark Structured Streaming, Delta Lake, PostgreSQL, and Grafana. I designed Bronze, Silver, Gold, quarantine, DLQ, and alerts. |
-| Result | In lite mode, 10 sensors run on an 8 GB laptop. Tests prove deterministic faults, AQI boundaries, restart safety, and coverage gates. |
+| Action | I used Python, Kafka 4, one shared PySpark Structured Streaming driver, Delta Lake, and PostgreSQL. I built Bronze/Silver/Gold, quarantine, DLQ, alerts/outbox, and JSON/text/CSV inspection. |
+| Result | Tests prove deterministic faults, AQI boundaries, persisted restart, offline operation, and coverage gates. I report actual resource/latency measurements only after implementation, against the proposed 8 GB lite target. |
 
 ## Interview questions by topic
 
@@ -58,14 +58,14 @@ Use STAR.
 | 22 | How is an unhealthy alert triggered? | Poor or worse; 2 consecutive 15-minute windows; stable alert ID. |
 | 23 | How does cooldown work? | 60 minutes; per city and category; prevents repeated alerts. |
 
-### SQL, PostgreSQL, and Grafana
+### SQL, PostgreSQL, and Python inspection
 
 | # | Question | Key points to cover |
 |---:|---|---|
-| 24 | Why use PostgreSQL for Gold? | Grafana data source; SQL queries; unique keys; local free tool. |
+| 24 | Why use PostgreSQL for Gold? | SQL/CLI serving tables, unique keys, final-state protection, local free tool, SELECT-only inspector. |
 | 25 | What is an idempotent upsert? | Same business key updates one row; safe replay; no duplicate city-window rows. |
-| 26 | Which indexes matter? | City plus window start; station plus window start; alert ID; dashboard time filters. |
-| 27 | How does Grafana show null AQI? | Text says `Insufficient data`; labels plus colours; accessibility. |
+| 26 | Which indexes matter? | City/window start, station/window start, alert ID, parameterized inspection time/status filters. |
+| 27 | How does inspection show null AQI? | JSON null, CSV empty AQI/category cells, text `Insufficient data`; no zero substitution; indicative basis and PROVISIONAL/FINAL status remain explicit. |
 
 ### Testing and DevOps
 
@@ -73,7 +73,7 @@ Use STAR.
 |---:|---|---|
 | 28 | What makes the 100-message test deterministic? | Seed `vayu-lite-001`; fixed timestamps; fixed batch schedule; isolated checkpoint. |
 | 29 | How do you test restart recovery? | Fail after sink write; restart with checkpoint; assert one PostgreSQL row per key. |
-| 30 | What quality gates block merge? | Ruff; mypy; tests; coverage; Gitleaks; pip-audit; Trivy; image build. |
+| 30 | What quality gates block merge? | Ruff/mypy, separate Python line/branch gates, AQI 100% branch, deterministic/recovery tests, exact inspection snapshots, four local acceptance tests, scans, pinned build. |
 | 31 | Why pin Docker images? | Reproducible grading; avoid surprise version changes; match compatibility matrix. |
 | 32 | What would you monitor in production? | Consumer lag; micro-batch duration; input and output counts; DLQ rate; alert count. |
 
@@ -81,15 +81,17 @@ Use STAR.
 
 | # | Question | Key points to cover |
 |---:|---|---|
-| 1 | How did you choose the lite profile limits? | 8 GB RAM; 1 broker; Spark 2304 MiB; 10 sensors; no Kafka UI. |
+| 1 | How did you choose the lite profile limits? | Four-core 8 GB target; 1 broker, 1 shared driver with six queries; proposed Spark 2048 MiB including 1280m heap/Python/non-heap; 10 stations; no UI services; measured trainer pre-check. |
 | 2 | How do malformed JSON events move through the pipeline? | Bronze keeps raw payload; Silver parse fails; quarantine row; DLQ message. |
 | 3 | How do duplicates affect Bronze, Silver, and Gold? | Bronze keeps both; Silver dedupes by `event_id`; Gold reading count excludes duplicate. |
 | 4 | How do you calculate completeness for Delhi? | Unique valid readings; expected readings; 15 minutes; active sensors; rounded percent. |
-| 5 | Why are alerts stored in PostgreSQL and Kafka? | PostgreSQL for dashboard; Kafka for consumers; same `alert_id`; at-least-once delivery. |
+| 5 | Why are alerts stored in PostgreSQL and Kafka? | PostgreSQL for inspection, persisted cursor/cooldown/outbox; Kafka for consumers; stable `alert_id`; at-least-once publication, deduplicated side effects. |
 | 6 | What happens if PostgreSQL is down? | Sink fails or retries; health degraded; checkpoint prevents silent loss; runbook recovery. |
 | 7 | How do you reprocess Bronze to Silver? | Choose date range; preserve raw data; write to isolated checkpoint; compare counts. |
 | 8 | What is the hardest Spark bug you debugged? | Explain symptom; plan; metric or log used; fix; test added. |
-| 9 | How would standard mode change performance? | 50 sensors; 10 readings/sec; more partitions; Kafka UI; 16 GB RAM. |
+| 9 | How would standard mode change performance? | 50 stations, 10 readings/sec, 16 GB RAM recommended; a separately budgeted shared driver, not per-query drivers or required UI services. |
+| 10 | How did you prove offline local operation? | Cache locked dependencies/images/connector JARs initially; single start/stop entry points; loopback ports; exact seeded `100/87/6/6` counts; persisted state and clear dependency failures. |
+| 11 | How do CLI fixtures differ from streaming fixtures? | Independent sink-contract rows prove exact serialization; they are not mixed into the 100-message dataset or represented as streamed demo results. |
 
 ## Fundamentals check
 
@@ -134,8 +136,9 @@ Use STAR.
 | Delta files | Amazon S3 plus table format | Cloud storage changes operations, not medallion concepts. |
 | Spark local | AWS Glue or EMR | Same Spark DataFrame and Structured Streaming concepts apply. |
 | PostgreSQL | Amazon RDS for PostgreSQL | Upserts, indexes, and SQL skills transfer. |
-| Grafana OSS | Amazon Managed Grafana | Dashboard design and queries transfer. |
 | Docker Compose | ECS task or Kubernetes pod idea | Containers package services; orchestration differs. |
+
+This table is DevOps interview terminology only, not a cloud-deployment exercise or account requirement.
 
 ## Resume bullets
 
@@ -143,7 +146,8 @@ Use STAR.
 - Designed Bronze, Silver, Quarantine, and Gold layers with Delta Lake and PostgreSQL, preventing duplicate business keys during replay.
 - Implemented CPCB indicative AQI calculation with 100% branch coverage across breakpoint boundary tests.
 - Created deterministic streaming tests with 100 messages, 5 extra duplicate copies, 6 invalid records, and 2 late drops.
-- Delivered Grafana dashboards for current AQI, AQI trend, and alerts, with labels for accessible interpretation.
+- Delivered tested Python current/windows/completeness/alerts commands with exact JSON/text/CSV, nullable AQI, indicative basis, and provisional/final status.
+- Verified offline local startup and persisted offsets/checkpoints/outbox with `[local_test_count]` acceptance tests; quote measured RAM only after implementation.
 
 ## GitHub and LinkedIn tips
 
@@ -161,6 +165,7 @@ Use STAR.
 - Show the latest CI run and coverage report.
 - Explain one trade-off from an ADR.
 - Run one SQL query against a gold table.
+- Show exact inspection output, null/empty/error behavior, and local stop/start without opening a built-in console.
 - Answer why at-least-once delivery can create duplicates.
 - Explain what you would improve with one more week.
 

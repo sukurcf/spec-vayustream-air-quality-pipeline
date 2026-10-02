@@ -12,9 +12,10 @@ Purpose: This document defines the exact VayuStream pipeline interfaces, topics,
 | Silver streaming query | Spark Structured Streaming | FR-SLV-01, FR-SLV-02, FR-SLV-03, FR-SLV-04 |
 | Gold streaming queries | Spark Structured Streaming and PostgreSQL | FR-GLD-01, FR-AQI-01, FR-GLD-02 |
 | Alert poller | Restartable Python process and Kafka producer | FR-ALT-01, FR-ALT-02 |
-| Grafana serving tables | PostgreSQL read interface | FR-DASH-01, FR-DASH-02 |
+| Python inspection CLI | PostgreSQL SELECT-only JSON/text/CSV interface | FR-CLI-01, FR-CLI-02 |
 | Daily AQI batch | Should batch job | FR-DAILY-01 |
 | Operations runbook | Human procedure | FR-OPS-03 |
+| Local lifecycle and demo | Python start/stop/health/confirmed-reset and seeded operation | FR-OPS-02 |
 
 ## Kafka topic specification
 
@@ -25,6 +26,8 @@ Purpose: This document defines the exact VayuStream pipeline interfaces, topics,
 | `vayu.alerts` | 3 | `alert_id` | 30 days minimum | `delete` | Alert poller | Alerting consumers and optional Mailpit worker | Delivery is at-least-once. |
 
 Topic creation MUST be part of the documented one-command start. Health checks MUST fail with `topic-missing` when any required topic is absent.
+
+Lite uses one combined KRaft broker/controller and replication factor `1` for all topics. Host clients use `127.0.0.1:19092`; container clients use `kafka:29092`, with matching advertised listeners. Controller ports are never published. Exact startup/migration/seed/port/persistence contracts are in doc 06.
 
 ## Producer requirements
 
@@ -93,6 +96,8 @@ The alert poller is not a Spark streaming query. It reads FINAL city rows from P
 
 Each checkpoint path MUST be isolated. Sharing a checkpoint path MUST make health status `unhealthy` with reason `checkpoint-not-isolated`.
 
+All six queries run in one `spark-submit` process and share one driver/SparkSession, not one JVM/container per query. Lite uses `local[2]`, shuffle partitions `2`, and `maxOffsetsPerTrigger=100`. Its proposed total Spark budget is `2048 MiB`, including a `1280m` JVM heap plus native/non-heap/Python memory. Disable Spark UI and publish no driver ports. Driver status/heartbeat is inspected locally without launching another Spark session.
+
 ## Bronze interface
 
 Bronze MUST append one row for each consumed raw Kafka message. It MUST store `bronze_id`, `topic`, `partition`, `offset`, `key`, `payload`, `kafka_timestamp`, `ingest_time`, and `ingest_date`. The audit key is `topic`, `partition`, and `offset`.
@@ -123,7 +128,7 @@ Example operation: a valid JSON event with `no2_ugm3=-1` creates no Silver row. 
 
 Gold station windows MUST use key `station_id` and `window_start`. Gold city windows MUST use key `city` and `window_start`. Alert rows MUST use key `alert_id`. Replayed batches MUST update the existing row instead of creating a duplicate.
 
-Gold writes the same PostgreSQL tables from 2 sink modes. Update-mode queries write `PROVISIONAL` rows for fast Grafana panels. Append-mode queries update the same rows to `FINAL` once `window_end` is less than or equal to the watermark. A later PROVISIONAL write MUST NOT overwrite a FINAL row.
+Gold writes the same PostgreSQL tables from 2 sink modes. Update-mode queries write `PROVISIONAL` rows for prompt CLI/SQL inspection. Append-mode queries update the same rows to `FINAL` once `window_end` is less than or equal to the watermark. A later PROVISIONAL write MUST NOT overwrite a FINAL row.
 
 | Sink | Business key | Required operation | Duplicate result |
 |---|---|---|---|
@@ -187,9 +192,77 @@ Alert event example:
 
 Expected result: consumers can receive the event more than once. They MUST store one incident by `alert_id`.
 
+## Python inspection CLI contract
+
+Requirements: `FR-CLI-01`, `BR-23`, `NFR-USE-02`, `NFR-SEC-03`. Implement `uv run --no-sync vayustream inspect <command>` in Python. Reuse the existing PostgreSQL client boundary; parsing, JSON, and CSV need no frontend framework. The inspector reads stored gold/alert results, not raw Kafka/Delta, and does not recalculate AQI, completeness, aggregates, or alert state.
+
+| Command | Source and selection | Exact ordered columns |
+|---|---|---|
+| `current` | `gold.city_window_aqi`: latest `window_start` per city among the requested statuses; default includes both PROVISIONAL and FINAL and labels the stored status. | `city`, `window_start`, `window_end`, `window_status`, `aqi_value`, `aqi_category`, `aqi_basis`, `completeness_pct` |
+| `windows` | Recent stored city rows from `gold.city_window_aqi`; do not collapse different window keys. | `city`, `window_start`, `window_end`, `window_status`, `reading_count`, `expected_readings`, `completeness_pct`, `pm25_avg_ugm3`, `pm10_avg_ugm3`, `no2_avg_ugm3`, `aqi_value`, `aqi_category`, `aqi_basis` |
+| `completeness --level city` | Recent city windows from `gold.city_window_aqi`. | `city`, `window_start`, `window_end`, `window_status`, `reading_count`, `expected_readings`, `completeness_pct` |
+| `completeness --level station` | Recent station windows from `gold.station_window_metrics`. | `station_id`, `city`, `window_start`, `window_end`, `window_status`, `reading_count`, `expected_readings`, `completeness_pct` |
+| `alerts` | `alerts.alert_events`; each stable `alert_id` appears once even if Kafka publishes it twice. | `alert_id`, `city`, `alert_type`, `aqi_category`, `aqi_value`, `status`, `trigger_window_start`, `trigger_window_end`, `created_at`, `cooldown_until` |
+
+Use the SELECT-only `vayu_inspector`; grant no raw access or write privileges. Validate city/station values against the configured fictional station reference, allowlist command/status/column choices, and parameterize every SQL value.
+
+| Argument | Exact contract |
+|---|---|
+| `--format` | Required `json`, `text`, or `csv` on every command. |
+| `--city` | Optional registered city equality on all commands. Unknown city is invalid input, not a SQL fragment. |
+| `--window-status` | `ANY` (default), `PROVISIONAL`, or `FINAL`; allowed only on current/windows/completeness. FINAL protection and the business key remain unchanged. |
+| `--level` | Completeness only: `city` default or `station`. |
+| `--station` | Optional known station equality only for completeness with `--level station`. |
+| `--since`, `--until` | Optional timezone-aware ISO-8601 bounds for windows/completeness (`window_start`) or alerts (`created_at`); inclusive lower, exclusive upper, lower strictly before upper. Reject them on current. |
+| `--limit` | Windows/completeness/alerts only: integer 1 to 1000, default 10. Apply filters/order before limiting. Current returns one latest row per selected city. |
+| `--status` | Alerts only: `ACTIVE`, `COOLDOWN`, or `RECOVERED`; omitted means all stored alert statuses. |
+| `--output` | Optional output file; omitted means stdout. Write the complete payload atomically and leave stdout empty when a file is supplied. Failure preserves an existing file. |
+
+Current rows sort by city ascending. Windows/completeness sort by `window_start` descending, then city ascending and station ID ascending when present. Alerts sort by `created_at` descending, then `alert_id` ascending. Do not include volatile `updated_at` or query-time timestamps in the result.
+
+JSON is UTF-8 compact `{"command":"<name>","row_count":N,"rows":[...]}` with those keys in order, exact row columns above, and one trailing LF. AQI/counts are integers; decimals are strings preserving stored scale, with completeness exactly two decimals. Timestamps normalize to UTC with `Z`. Null remains JSON `null`, never numeric zero. CSV uses the exact column header, comma delimiter, standard double-quote escaping, LF endings/final LF, and empty cells for null. No binary float conversion is allowed.
+
+Text begins `command=<name> rows=<N>`, followed by the same ordered column header and rows separated by tab characters, with LF endings. Render null AQI as `Insufficient data`, other null cells as `-`; keep stored category and `15-minute indicative` basis, not colors or a terminal dashboard. All logs/errors go to stderr.
+
+### Independent inspection-contract fixture and exact outputs
+
+Fixture `inspection_contract_delhi` seeds one FINAL city row in an isolated test database: Delhi, 10:00-10:15 UTC on `2026-10-02`, reading count `350`, expected `360`, completeness `97.22`, pollutant averages `95/260/90`, sub-indexes `215/210/110`, AQI `215`, category `Poor`, basis `15-minute indicative`. This sink-contract fixture reuses existing AQI/completeness numerical examples; it is NOT the 100-event streaming fixture and MUST NOT be mixed into its row counts.
+
+```text
+uv run --no-sync vayustream inspect current --city Delhi --window-status FINAL --format json
+```
+
+Exact JSON:
+
+```json
+{"command":"current","row_count":1,"rows":[{"city":"Delhi","window_start":"2026-10-02T10:00:00Z","window_end":"2026-10-02T10:15:00Z","window_status":"FINAL","aqi_value":215,"aqi_category":"Poor","aqi_basis":"15-minute indicative","completeness_pct":"97.22"}]}
+```
+
+With `--format csv`, exact output is:
+
+```text
+city,window_start,window_end,window_status,aqi_value,aqi_category,aqi_basis,completeness_pct
+Delhi,2026-10-02T10:00:00Z,2026-10-02T10:15:00Z,FINAL,215,Poor,15-minute indicative,97.22
+```
+
+For a known city with no stored rows, JSON is exactly `{"command":"current","row_count":0,"rows":[]}` plus LF; CSV is the current header plus LF; text has `command=current rows=0` and the header with no data rows. All exit `0`. A separate null-AQI row preserves null value/category in JSON, blank CSV cells, and `Insufficient data` in text. Tests snapshot all four commands in all three formats, including PROVISIONAL/FINAL rows and the existing alert-event example.
+
+### Optional summary and exit behavior
+
+`FR-CLI-02` adds `inspect summary` only after Must scope passes. It uses completeness's level/filter/order rules and columns, followed by stored `pm25_avg_ugm3`, `pm25_min_ugm3`, `pm25_max_ugm3`, corresponding PM10 and NO2 avg/min/max columns, then Boolean `needs_review` for completeness strictly below `90.00`. JSON Boolean is native; CSV/text use `true`/`false`. It adds no frontend or new AQI arithmetic.
+
+| Exit | Condition and stable stderr `error_id` |
+|---:|---|
+| 0 | Successful inspection/local operation, including empty results. |
+| 2 | `cli-invalid-argument`, `profile-unsupported`, `lite-service-disabled`, `lite-driver-count-invalid`, or `reset-confirmation-required`; no SQL/destructive action for invalid arguments. |
+| 3 | `docker-unavailable`, `kafka-unavailable`, `postgres-unavailable`, `query-not-running`, `alert-poller-stale`, `topic-missing`, `checkpoint-not-isolated`, `seed-fixture-missing`, or `local-port-in-use`; preserve data and fail clearly. |
+| 4 | `inspection-output-failed` for an unwritable file, or `demo-workspace-not-clean`; no partial output or automatic reset. |
+
+Database connect timeout is bounded at 5 seconds. Error JSON uses the fields below; failures have no partial stdout or secret/stack-trace leakage. Doc 06 defines the single start/stop interface, health JSON, seed demonstration output, persisted storage, and confirmed reset. Built-in consoles are never needed to prove these interfaces.
+
 ## Error format
 
-Pipeline commands and health checks MUST report errors with stable identifiers. Log records SHOULD be JSON. The error format has these fields.
+Pipeline/local/inspection commands and health checks MUST report errors with stable identifiers. CLI errors use this JSON format on stderr without secrets or stack traces; inspection failures leave stdout empty and preserve any existing output file. Log records SHOULD be JSON. The error format has these fields.
 
 | Field | Type | Required | Example |
 |---|---|---|---|
@@ -204,7 +277,7 @@ Example:
 ```json
 {
   "error_id": "checkpoint-not-isolated",
-  "message": "Query gold_city_aqi shares a checkpoint path.",
+  "message": "Query gold_city_aqi_final shares a checkpoint path.",
   "component": "health-check",
   "correlation_id": "run-20261002-001",
   "details": {
@@ -223,8 +296,8 @@ Example:
 | Alert poller | Poller heartbeat is newer than 60 seconds. | `alert-poller-stale` |
 | Checkpoints | Query checkpoint paths are unique. | `checkpoint-not-isolated` |
 | PostgreSQL | Connection succeeds and serving tables exist. | `postgres-unavailable` |
-| Grafana | Data source points to PostgreSQL. | `grafana-datasource-invalid` |
-| Lite profile | Kafka UI is disabled and Spark limit is 2304 MiB with 1500m heap. | `lite-service-disabled` |
+| Lite profile | No UI services; one shared driver with six queries and proposed Spark 2048 MiB/1280m heap. | `lite-service-disabled`, `lite-driver-count-invalid` |
+| Local configuration | Doc 06 fixed ports bind only to `127.0.0.1`; initialized fixtures/migrations exist. | `local-port-in-use`, `seed-fixture-missing` |
 
 Example operation: Kafka is down at startup. Health status is `unhealthy`, failure reason is `kafka-unavailable`, and the simulator MUST not publish events.
 
@@ -310,6 +383,6 @@ Expected result: reprocessing `ingest_date=2026-10-02` corrects Silver validatio
 | Query crash | Restart from isolated checkpoint. | Runbook demo. |
 | Duplicate alert delivery | Consumer deduplicates by `alert_id`. | Alert consumer test. |
 
-Lite p95 ingest-to-dashboard latency MUST be 120 seconds or less. Producer throughput MUST sustain 2 readings per second for 10 minutes.
+Lite p95 ingest-to-inspectable PROVISIONAL PostgreSQL gold latency MUST be 120 seconds or less. FINAL readiness follows the event-time watermark, not this latency target. Producer throughput MUST sustain 2 readings per second for 10 minutes. Local runtime uses the simulator; Open-Meteo is explicit opt-in and its tests use recorded responses.
 
 [Back to README](../README.md)

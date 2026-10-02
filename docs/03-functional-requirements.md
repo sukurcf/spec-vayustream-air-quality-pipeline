@@ -21,22 +21,22 @@ Purpose: This document defines VayuStream behavior with traceable functional req
 | FR-GLD-02 | PostgreSQL idempotent gold upserts | Must | Data engineer, Data analyst | BR-19 |
 | FR-ALT-01 | Alert creation and cooldown | Must | Environment officer, Alerting consumer | BR-20, BR-21 |
 | FR-ALT-02 | Recovery alert | Must | Environment officer, Alerting consumer | BR-22 |
-| FR-DASH-01 | Minimum Grafana dashboard | Must | Environment officer, Data analyst | BR-23 |
+| FR-CLI-01 | Inspect AQI, windows, completeness, and alerts | Must | Environment officer, Data analyst | BR-23 |
 | FR-OPS-01 | Checkpoints and restart safety | Must | Data engineer | BR-24 |
-| FR-OPS-02 | Health checks and one-command start | Must | Data engineer | BR-25 |
+| FR-OPS-02 | Local start/stop, initialization, and health | Must | Data engineer | BR-25 |
 | FR-OPS-03 | Runbook operations | Must | Data engineer | BR-26 |
 | FR-TEST-01 | Required deterministic tests | Must | Trainer, Data engineer | BR-27 |
 | FR-REAL-01 | Open-Meteo real-data mode | Should | Data analyst, Data engineer | BR-28 |
-| FR-DASH-02 | Extended dashboard panels | Should | Environment officer | BR-29 |
+| FR-CLI-02 | Extended machine-readable pollutant summary | Should | Environment officer | BR-29 |
 | FR-DAILY-01 | Daily official-style AQI batch | Should | Data analyst | BR-30 |
-| FR-MAINT-01 | Delta maintenance and Kafka UI | Should | Data engineer | BR-31 |
+| FR-MAINT-01 | Delta maintenance and progress evidence | Should | Data engineer | BR-31 |
 | FR-STR-01 | Optional advanced storage and schema features | Could | Data engineer | BR-32 |
 
 ## Must requirements
 
 ### FR-SIM-01 Lite simulator station network
 
-Description: The simulator MUST publish readings for 10 sensors in 5 Indian cities. It MUST read station reference data with station ID, city, state, latitude, longitude, and installed date. Each active sensor MUST publish one reading every 5 seconds unless the configured profile changes the interval.
+Description: The simulator is the explicit default source and MUST run without internet after initial downloads. It MUST publish readings for 10 sensors in 5 Indian cities and read fictional local station reference data with station ID, city, state, latitude, longitude, and installed date. Each active sensor MUST publish one reading every 5 seconds unless the configured scenario changes the interval. Open-Meteo is a separate opt-in source, never an implicit startup dependency.
 
 Priority: Must. Roles: Data engineer, Sensor simulator. Linked BR IDs: BR-01, BR-02.
 
@@ -165,8 +165,8 @@ Priority: Must. Roles: Environment officer, Data analyst. Linked BR IDs: BR-17, 
 Acceptance criteria:
 - Given city averages PM2.5 95 µg/m³, PM10 260 µg/m³, and NO2 90 µg/m³, when AQI is calculated, then AQI is 215 and category is Poor.
 - Given only NO2 and PM10 are valid for a city window, when AQI is calculated, then `aqi_value` is null because fewer than 3 pollutants are available.
-- Given PM2.5, PM10, and NO2 are available and PM10 is missing, when PM2.5 and NO2 remain with no third pollutant, then `aqi_value` is null and not 0.
-- Given an AQI panel title is rendered, when the value is from a 15-minute window, then the label includes `indicative`.
+- Given PM2.5 and NO2 are valid but PM10 is null and no third pollutant remains, when AQI is calculated, then `aqi_value` is null and not 0.
+- Given a 15-minute AQI is inspected, when JSON/text/CSV is returned, then `aqi_basis` is `15-minute indicative` and the window's PROVISIONAL/FINAL status is explicit.
 
 ### FR-GLD-02 PostgreSQL idempotent gold upserts
 
@@ -201,20 +201,21 @@ Acceptance criteria:
 - Given Mumbai AQI becomes 201, when the window closes, then no recovery alert is created.
 - Given a recovery event is delivered twice, when consumers deduplicate by `alert_id`, then one recovery incident is visible.
 
-### FR-DASH-01 Minimum Grafana dashboard
+### FR-CLI-01 Inspect AQI, windows, completeness, and alerts
 
-Description: Grafana MUST use a provisioned PostgreSQL data source. The dashboard MUST have current AQI for each city with CPCB colours, AQI trend, and alerts table. It MUST show null AQI as insufficient data.
+Description: The Python CLI `vayustream inspect` MUST provide `current`, `windows`, `completeness`, and `alerts` commands reading PostgreSQL gold/alert tables through a SELECT-only inspector user. It MUST return exact JSON/text/CSV contracts in doc 08, with validated parameterized filters, deterministic ordering, explicit window status, and no duplicated AQI calculations. No business behavior requires a built-in console.
 
 Priority: Must. Roles: Environment officer, Data analyst. Linked BR IDs: BR-23.
 
 Acceptance criteria:
-- Given city AQI is 250, when Grafana renders current AQI, then the city uses the Poor colour and label.
-- Given `aqi_value` is null, when Grafana renders the panel, then the value text is `Insufficient data`.
-- Given at least one alert exists, when the alerts table loads, then it shows `alert_id`, city, category, status, and created time.
+- Given stored city AQI is 250, when current AQI is inspected, then it returns integer `250`, category `Poor`, `15-minute indicative`, and the stored window status, not a color or chart.
+- Given `aqi_value` is null, when inspection runs, then JSON retains null, CSV leaves the AQI/category cells empty, and text says `Insufficient data`, never `0`.
+- Given recent windows and alerts exist, when all four commands run in each format, then doc 08's exact fields/order are returned; alerts preserve `alert_id`, city, category, status, and created time.
+- Given invalid city/format/status input, when the CLI runs, then it exits `2` with `cli-invalid-argument` before SQL. PostgreSQL unavailability exits `3` with `postgres-unavailable`, with no partial stdout or file.
 
 ### FR-OPS-01 Checkpoints and restart safety
 
-Description: Every streaming query MUST have an isolated checkpoint directory. A restart MUST cause no data loss. Delta tables and PostgreSQL tables MUST avoid duplicates by idempotent writes and keys.
+Description: Every streaming query MUST have an isolated checkpoint directory, while all six queries share one Spark driver/SparkSession in lite mode. A restart MUST cause no data loss. Delta tables and PostgreSQL tables MUST avoid duplicates by idempotent writes and keys. Local stop/start MUST preserve Kafka offsets, Delta data/checkpoints, PostgreSQL gold, poller cursor, cooldowns, and outbox state.
 
 Priority: Must. Primary role: data engineer for recovery. Linked BR IDs: BR-24.
 
@@ -223,20 +224,23 @@ Acceptance criteria:
 - Given failure happens after PostgreSQL sink write and before checkpoint commit, when the batch replays, then gold row count remains unchanged.
 - Given two queries share one checkpoint path, when health checks run, then status is `unhealthy` with code `checkpoint-not-isolated`.
 
-### FR-OPS-02 Health checks and one-command start
+### FR-OPS-02 Local start/stop, initialization, and health
 
-Description: The student repository MUST provide one documented command that starts the lite stack. Health checks MUST verify Kafka, topics, Spark query status, PostgreSQL, and Grafana data source. Lite profile MUST fit 8 GB RAM.
+Description: The student MUST implement doc 06's single start and stop entry points, idempotent topic/database/migration/fictional-seed initialization, local health checks, deterministic offline demo, persistent storage, and explicitly confirmed reset. Health checks verify Kafka/topics, the one shared Spark driver's six queries/checkpoints, PostgreSQL, and alert-poller heartbeat. Lite targets a four-core 8 GB host with no UI services; resource budgets are proposed, not measured.
 
 Priority: Must. Primary role: data engineer for local operations. Linked BR IDs: BR-25.
 
 Acceptance criteria:
-- Given a clean clone on the lite reference laptop, when the documented start command runs, then health status becomes `healthy` within 5 minutes.
+- Given a clean clone on the lite reference laptop after initial downloads, when the doc 06 start command runs without external network, then health becomes `healthy` within 5 minutes with simulator source mode and fixed loopback bindings. Start exits `0` and prints doc 06's exact healthy JSON.
 - Given Kafka is unavailable, when health checks run, then status is `unhealthy` and simulator does not start publishing.
-- Given Kafka UI is enabled in lite mode, when profile validation runs, then it fails with code `lite-service-disabled`.
+- Given any UI service or multiple Spark drivers are configured for lite mode, when profile validation runs, then it fails with `lite-service-disabled` or `lite-driver-count-invalid`.
+- Given the seeded 100-message demonstration runs, when it completes, then doc 06's exact output matches the unchanged Bronze/Silver/DLQ/quarantine/drop/window counts.
+- Given stop/start follows a completed demo, when counts, checkpoints, and poller/outbox state are compared, then they survive unchanged and initialization does not republish the seed.
+- Given invalid profile, unavailable Docker/Kafka/PostgreSQL, or unconfirmed reset, when a local command runs, then doc 08's error/exit contract applies; reset deletes no data without `--confirm-delete-data`.
 
 ### FR-OPS-03 Runbook operations
 
-Description: The runbook MUST explain restart, replay from Kafka offsets, and Bronze-to-Silver reprocessing. It MUST include safe warnings for at-least-once outputs and idempotent upserts. It MUST state when checkpoints may be reset.
+Description: The runbook MUST explain local start/stop/confirmed reset, offline demo, inspection commands, restart, Kafka offset replay, and Bronze-to-Silver reprocessing. It MUST include safe warnings for at-least-once outputs and idempotent upserts and state when checkpoints may be reset. Console inspection is optional operations only, not business proof.
 
 Priority: Must. Primary role: data engineer for runbook use. Linked BR IDs: BR-26.
 
@@ -247,7 +251,7 @@ Acceptance criteria:
 
 ### FR-TEST-01 Required deterministic tests
 
-Description: The implementation MUST include tests for event contracts, transformations, AQI boundaries, deterministic streaming, and restart recovery. AQI module branch coverage MUST be 100%. The full project MUST meet line coverage 80% and branch coverage 70%.
+Description: The implementation MUST retain at least 45 meaningful tests for event contracts, transformations, AQI boundaries, deterministic streaming, restart recovery, Python inspection, and doc 09's local acceptance cases. AQI module branch coverage MUST be 100%. The full project, including inspection/local Python code, MUST meet separate line coverage 80% and branch coverage 70% gates.
 
 Priority: Must. Roles: Trainer, Data engineer. Linked BR IDs: BR-27.
 
@@ -260,23 +264,23 @@ Acceptance criteria:
 
 ### FR-REAL-01 Open-Meteo real-data mode
 
-Description: The system SHOULD poll the Open-Meteo Air Quality API once per hour for each configured city. It SHOULD publish events with `source=open-meteo` after confirming free, no-key, non-commercial API terms. It SHOULD convert units when the API differs from VayuStream units.
+Description: An explicitly enabled real-source publisher SHOULD poll Open-Meteo once per hour for each configured city and publish `source=open-meteo` after confirming free, no-key, non-commercial terms. It SHOULD convert differing units. Default local startup and tests MUST not enable it; real-source parser/failure tests use recorded responses.
 
 Priority: Should. Roles: Data analyst, Data engineer. Linked BR IDs: BR-28.
 
 Acceptance criteria:
 - Given Open-Meteo mode is enabled for 5 cities, when the hourly poll runs, then one batch per city is published with `source=open-meteo`.
-- Given the API is unavailable, when the poll fails, then the system logs `open-meteo-unavailable` and does not stop simulator mode.
+- Given the API is unavailable, when the poll fails, then it logs `open-meteo-unavailable` and does not stop an independently running simulator. It does not silently start a simulator or change source mode.
 
-### FR-DASH-02 Extended dashboard panels
+### FR-CLI-02 Extended machine-readable pollutant summary
 
-Description: The dashboard SHOULD add pollutant breakdown and station completeness panels. It SHOULD contain at least 5 Grafana panels in standard profile. It SHOULD keep the 3 Must panels unchanged.
+Description: After Must scope passes, `vayustream inspect summary` SHOULD export stored pollutant average/minimum/maximum columns and completeness review flags as JSON/text/CSV for city or station windows. It reads existing metrics, never rebuilds aggregates or AQI. It keeps the four Must inspection commands unchanged.
 
 Priority: Should. Roles: Environment officer. Linked BR IDs: BR-29.
 
 Acceptance criteria:
-- Given standard profile is enabled, when Grafana loads, then it shows at least 5 panels.
-- Given a station has completeness 70%, when the completeness panel renders, then it highlights the station below the 90% review threshold.
+- Given a stored window has PM2.5 minimum `40` and maximum `55`, when summary is exported, then those exact stored values are returned.
+- Given a station has completeness `70.00%`, when summary is exported, then `needs_review=true` under the `90.00%` threshold; a `90.00%` row has `needs_review=false`.
 
 ### FR-DAILY-01 Daily official-style AQI batch
 
@@ -288,25 +292,26 @@ Acceptance criteria:
 - Given a complete day of city data, when the daily batch runs, then one row per city is written to `gold.daily_city_aqi`.
 - Given CO is included, when daily AQI is calculated, then it uses the maximum 8-hour average for CO.
 
-### FR-MAINT-01 Delta maintenance and Kafka UI
+### FR-MAINT-01 Delta maintenance and progress evidence
 
-Description: The project SHOULD schedule Delta maintenance for OPTIMIZE-like compaction and VACUUM-like retention. It SHOULD expose Kafka UI in standard profile only. It SHOULD log streaming progress and consumer lag.
+Description: The project SHOULD schedule Delta maintenance for OPTIMIZE-like compaction and VACUUM-like retention and log streaming progress/consumer lag. No built-in console is a Should deliverable or grader requirement.
 
 Priority: Should. Roles: Data engineer. Linked BR IDs: BR-31.
 
 Acceptance criteria:
-- Given standard profile is enabled, when services start, then Kafka UI is available and shows `vayu.readings.raw`.
+- Given progress evidence is requested, when logs are inspected, then query names, batch IDs, offsets, and consumer lag can be read without a console.
 - Given maintenance runs, when retention is checked, then it does not delete files needed by active checkpoints.
 
 ### FR-STR-01 Optional advanced storage and schema features
 
-Description: The project COULD add Avro with an open-source schema registry. It COULD add maintained S3-compatible storage after an ADR verifies licence and maintenance status. It COULD add z-score sensor-drift detection and a Grafana Geomap.
+Description: After Must scope passes, the project COULD add Avro with an open-source schema registry, maintained local S3-compatible storage after an ADR, z-score sensor-drift detection, or a Python replay-verification evidence command. No frontend or cloud deployment is allowed. Additional storage/schema services run only in a separately budgeted standard profile.
 
 Priority: Could. Roles: Data engineer. Linked BR IDs: BR-32.
 
 Acceptance criteria:
 - Given Avro mode is enabled, when an incompatible schema is published, then the producer rejects it before Kafka send.
 - Given object storage is chosen, when the ADR is reviewed, then it explains current maintenance status and local cost.
+- Given replay-verification is chosen, when a controlled sink-write failure is replayed, then a JSON/CSV evidence bundle compares saved offsets and key counts, reports zero duplicate business keys, and preserves the original data/checkpoints.
 
 ## Business rules
 
@@ -334,15 +339,15 @@ Acceptance criteria:
 | BR-20 | Unhealthy alert threshold is Poor or worse, AQI 201 or more, for 2 consecutive 15-minute windows. | FR-ALT-01 |
 | BR-21 | Alert cooldown is `created_at` plus 60 minutes for each city and AQI category; retries keep the original `created_at`. | FR-ALT-01 |
 | BR-22 | Recovery alert threshold is AQI less than or equal to 200. | FR-ALT-02 |
-| BR-23 | Must Grafana panels are current AQI, AQI trend, and alerts table. | FR-DASH-01 |
+| BR-23 | Four Must inspection commands are `current`, `windows`, `completeness`, and `alerts`; JSON/text/CSV preserve doc 08 fields/order, indicative basis, window status, and null AQI. | FR-CLI-01 |
 | BR-24 | Each streaming query has one isolated checkpoint directory. | FR-OPS-01 |
-| BR-25 | Lite profile disables Kafka UI and uses Spark 2304 MiB with 1500m heap. | FR-OPS-02 |
+| BR-25 | Lite targets 8 GB/four cores with one broker, one shared Spark driver/SparkSession for six queries, 10 stations, no UI services, and proposed 2048 MiB Spark budget including Python workers with 1280m heap. Doc 06 defines loopback ports, start/stop, seeds, persistence, and confirmed reset. | FR-OPS-02 |
 | BR-26 | Runbook covers restart, Kafka offset replay, and Bronze-to-Silver reprocessing. | FR-OPS-03 |
 | BR-27 | Coverage gates are line 80%, branch 70%, and AQI module branch 100%. | FR-TEST-01 |
 | BR-28 | Open-Meteo mode polls once per hour for each city and uses `source=open-meteo`. | FR-REAL-01 |
-| BR-29 | Standard Grafana dashboard has at least 5 panels. | FR-DASH-02 |
+| BR-29 | Optional inspection summary reads stored pollutant avg/min/max and flags completeness strictly below 90.00% for review; it adds no AQI calculation or UI. | FR-CLI-02 |
 | BR-30 | Daily AQI uses 24-hour averages for PM2.5, PM10, NO2, SO2, and NH3; CO uses maximum 8-hour averages; O3 uses 8-hour values through 208 µg/m³ and 1-hour values above 208 µg/m³. | FR-DAILY-01 |
-| BR-31 | Kafka UI and 50-sensor standard profile require 16 GB RAM. | FR-MAINT-01 |
+| BR-31 | The 50-sensor standard profile and extra maintenance/storage services require 16 GB RAM and an explicit local resource budget. Built-in consoles are optional operations only. | FR-MAINT-01 |
 | BR-32 | Could items require ADR approval before implementation. | FR-STR-01 |
 
 ## CPCB AQI method
@@ -460,7 +465,11 @@ stateDiagram-v2
 | Duplicate event within watermark | Drop duplicate from Silver. | Metric `duplicate_events_dropped` increments. |
 | Valid event at or before active watermark cutoff | Drop from Silver and count. | Metric `late_events_dropped` increments. |
 | PostgreSQL unavailable | Retry batch; keep checkpoint uncommitted until sink succeeds or query fails. | Query state `DEGRADED` then `FAILED` if retries exhaust. |
-| AQI lacks 3 pollutants | Store null AQI. | Dashboard text `Insufficient data` |
+| AQI lacks 3 pollutants | Store null AQI. | JSON null / CSV empty cell / text `Insufficient data` |
 | Alert delivered twice | Consumer deduplicates by `alert_id`. | One incident remains visible. |
+| Invalid inspection argument | Reject before SQL, exit `2`, no partial output. | `cli-invalid-argument` |
+| Unavailable local Docker/Kafka/PostgreSQL | Fail clearly on stderr, exit `3`; preserve persisted data. | `docker-unavailable`, `kafka-unavailable`, `postgres-unavailable` |
+| Lite includes UI services or multiple drivers | Refuse invalid configuration, exit `2`. | `lite-service-disabled`, `lite-driver-count-invalid` |
+| Reset not confirmed | Preserve local volumes and checkpoints, exit `2`. | `reset-confirmation-required` |
 
 [Back to README](../README.md)

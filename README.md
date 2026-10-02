@@ -1,6 +1,6 @@
 # VayuStream air-quality streaming pipeline
 
-Build a local Kafka, PySpark Structured Streaming, Delta Lake, PostgreSQL, and Grafana pipeline for indicative real-time city AQI.
+Build a local Python, Kafka, PySpark Structured Streaming, Delta Lake, and PostgreSQL pipeline with an inspection CLI for indicative real-time city AQI. Scope is Python, data engineering, backend interfaces, and DevOps only; no student-built frontend, including optional work.
 
 ## Quick facts
 
@@ -10,14 +10,14 @@ Build a local Kafka, PySpark Structured Streaming, Delta Lake, PostgreSQL, and G
 | Difficulty | ★★★★★ Advanced |
 | Duration | 6 weeks, about 180 hours |
 | Target job roles | Data Engineer, PySpark Developer, Spark / Databricks Engineer |
-| Key skills | Kafka, PySpark, Structured Streaming, Delta Lake, PostgreSQL, Grafana, data quality |
+| Key skills | Python CLI, Kafka, PySpark, Structured Streaming, Delta Lake, PostgreSQL, data quality, local reliability |
 | Prerequisites | Basic Python, SQL, Git, Linux commands, and Docker basics |
 | Minimum hardware | 8 GB RAM lite profile; 16 GB RAM recommended |
 | Student repository name | `vayustream` |
 
 ## What you will build
 
-- A deterministic sensor simulator for 10 stations in 5 Indian cities.
+- A deterministic, internet-free sensor simulator for 10 stations in 5 Indian cities; Open-Meteo is separately opt-in.
 - Kafka topics for raw readings, invalid readings, and alert events.
 - A Bronze Delta table that preserves raw Kafka payloads and metadata.
 - A Silver layer that validates, deduplicates, watermarks, and enriches readings.
@@ -25,7 +25,7 @@ Build a local Kafka, PySpark Structured Streaming, Delta Lake, PostgreSQL, and G
 - Indicative CPCB AQI calculation for city windows.
 - PostgreSQL gold tables with idempotent upserts.
 - Stable alerts for Poor or worse AQI with a 60-minute cooldown.
-- A Grafana dashboard with current AQI, AQI trend, and alert history.
+- A Python inspection CLI for current AQI, recent windows, completeness, and alerts in JSON/text/CSV.
 - A runbook for restart, replay from Kafka offsets, and Bronze-to-Silver reprocessing.
 
 ## Architecture at a glance
@@ -42,12 +42,14 @@ flowchart LR
   Gold --> Poller["Alert poller"]
   Poller --> Alerts["Kafka alerts topic"]
   Poller --> PG
-  PG --> Grafana["Grafana dashboard"]
+  PG --> CLI["Python inspection CLI: JSON, text, CSV"]
 ```
 
 ## How to read this specification
 
 Read the documents in order from 01 to 14. Start with scope and users. Then read requirements, architecture, data model, pipeline behavior, tests, setup, and evaluation.
+
+[Document 06](docs/06-tech-stack-and-setup.md) defines commands students MUST implement: `uv run --no-sync vayustream local start --profile lite` and `uv run --no-sync vayustream local stop`, initialization, loopback ports, offline demonstration, persistence, and confirmed reset. This repository contains specifications, not a running application. Kafka/Grafana built-in consoles MAY be inspected separately for operations, never implemented as a business interface or required for grading; lite starts no UI services.
 
 The keywords MUST, SHOULD, and MAY follow RFC 2119. MUST means mandatory for grading. SHOULD means recommended after Must scope works. MAY means optional.
 
@@ -76,7 +78,7 @@ IDs are traceability anchors. User stories use `US-NN`. Functional requirements 
 
 ### Individual work
 
-You MUST implement VayuStream alone in your own public repository. You MAY discuss concepts with classmates, but you MUST NOT copy code, tests, dashboards, or documentation from another student.
+You MUST implement VayuStream alone in your own public repository. You MAY discuss concepts with classmates, but you MUST NOT copy code, tests, CLI contracts, or documentation from another student.
 
 ### AI assistant policy
 
@@ -107,3 +109,4 @@ Every Friday, you MUST give a 15-minute demo to the trainer. Show one working in
 | Version | Date | Change |
 |---|---|---|
 | 1.0 | 2026-10-02 | First release |
+| 1.1 | 2026-10-02 | Backend/data/DevOps-only revision. Frontend and cloud-deployment work is removed; its effort and points move to Python JSON/text/CSV inspection, offline local acceptance, persistence, and recovery evidence. Six weeks, 100-point weights, and minimum 45 tests remain unchanged; lite uses one broker, one shared Spark driver, 10 stations, and no UI services. |

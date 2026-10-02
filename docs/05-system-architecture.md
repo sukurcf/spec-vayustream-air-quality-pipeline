@@ -6,8 +6,8 @@ Purpose: This document explains the VayuStream architecture, main flows, local d
 
 ```mermaid
 flowchart LR
-  Sensor["Sensor simulator"] --> Kafka["Kafka KRaft broker"]
-  OpenMeteo["Open-Meteo mode"] --> Kafka
+  Sensor["Default offline sensor simulator"] --> Kafka["Kafka KRaft broker"]
+  OpenMeteo["Explicit opt-in Open-Meteo"] --> Kafka
   Engineer["Data engineer"] --> Runbook["Runbook and health checks"]
   Kafka --> Spark["PySpark Structured Streaming"]
   Spark --> Delta["Delta Lake Bronze, Silver, Quarantine"]
@@ -15,13 +15,13 @@ flowchart LR
   Poller["Python alert poller"] --> Postgres
   Poller --> AlertTopic["Kafka alerts topic"]
   AlertTopic --> Consumers["Alerting consumers"]
-  Postgres --> Grafana["Grafana dashboard"]
-  Officer["Environment officer"] --> Grafana
-  Analyst["Data analyst"] --> Postgres
+  Postgres --> CLI["Python inspection CLI: JSON, text, CSV"]
+  Officer["Environment officer"] --> CLI
+  Analyst["Data analyst"] --> CLI
   Runbook --> Spark
 ```
 
-The system runs locally. It uses simulated air-quality stations as the Must source. Open-Meteo is a Should source only.
+The system runs locally without internet after initial downloads. Simulated stations are the default Must source; Open-Meteo is separately opt-in Should scope. No student frontend is implemented. Built-in Kafka/Grafana consoles may be inspected separately for operations only, never as business or grader evidence.
 
 ## Container and component diagram
 
@@ -30,10 +30,10 @@ flowchart TB
   subgraph Local["Local Docker environment"]
     Producer["Python simulator and producer"]
     Kafka["Apache Kafka 4.3 KRaft broker"]
-    Spark["Spark driver with PySpark jobs"]
+    Spark["One shared Spark driver and SparkSession: six queries"]
     DeltaStore["Local Delta storage"]
     Postgres["PostgreSQL 18"]
-    Grafana["Grafana OSS 13"]
+    CLI["Short-lived Python inspection CLI"]
     Poller["Python alert poller"]
     Health["Health check and task runner"]
   end
@@ -43,11 +43,10 @@ flowchart TB
   Spark -->|"provisional and final upserts"| Postgres
   Poller -->|"outbox and alert state"| Postgres
   Poller -->|"alert events"| Kafka
-  Grafana -->|"SQL queries"| Postgres
+  CLI -->|"SELECT-only parameterized queries"| Postgres
   Health --> Kafka
   Health --> Spark
   Health --> Postgres
-  Health --> Grafana
 ```
 
 ## Key sequence flows
@@ -86,19 +85,21 @@ sequenceDiagram
   Silver-->>Silver: commit checkpoint after all writes succeed
 ```
 
-### Gold AQI and dashboard
+### Gold AQI and Python inspection
 
 ```mermaid
 sequenceDiagram
   participant Silver as Silver valid readings
   participant Gold as Gold aggregation query
   participant PG as PostgreSQL
-  participant Grafana as Grafana
+  participant CLI as Python inspection CLI
   Gold->>Silver: read event-time micro-batch
   Gold->>Gold: build 15-minute windows
   Gold->>Gold: calculate CPCB sub-index and max AQI
   Gold->>PG: upsert PROVISIONAL and FINAL window rows
-  Grafana->>PG: read current AQI, trend, alerts
+  CLI->>PG: read AQI, windows, completeness, alerts
+  PG-->>CLI: stored values and PROVISIONAL or FINAL status
+  CLI-->>CLI: serialize exact JSON, text, or CSV
 ```
 
 ### Alert and recovery flow
@@ -148,16 +149,18 @@ sequenceDiagram
 7. Gold creates 15-minute station and city windows. It calculates completeness and indicative AQI.
 8. Gold upserts PROVISIONAL rows in Update mode and FINAL rows in Append mode.
 9. The alert poller reads FINAL city windows, writes outbox rows, and publishes at-least-once alert messages.
-10. Grafana reads PostgreSQL only. It does not read directly from Kafka or Delta.
+10. The Python inspection CLI reads PostgreSQL serving tables only. It does not read raw Kafka/Delta or recompute AQI, and keeps null AQI and PROVISIONAL/FINAL status explicit.
 
 ## Local deployment view
 
-| Profile | Laptop | Services | Required limits |
+| Profile | Laptop | Services | Proposed limits, not measurements |
 |---|---|---|---|
-| Lite | 8 GB RAM | Kafka, Spark local mode, PostgreSQL, Grafana, simulator | Kafka 768 MiB, Spark 2304 MiB, PostgreSQL 384 MiB, Grafana 192 MiB, simulator 128 MiB, Kafka UI disabled. |
-| Standard | 16 GB RAM | Lite services plus Kafka UI and optional Mailpit | 50 sensors, 10 cities, Spark driver memory chosen by ADR, Kafka UI enabled. |
+| Lite | 4 cores, 8 GB RAM | One Kafka broker, one shared Spark driver, PostgreSQL, simulator/poller, short-lived CLI | Proposed aggregate 3392 MiB including Spark 2048 MiB/1280m heap and Python workers; no UI services. |
+| Standard | 16 GB RAM recommended | Same core services, optional Mailpit | 50 sensors, 10 cities; proposed 6144 MiB including Mailpit; no required UI services. |
 
 Windows users SHOULD use WSL2. For 8 GB laptops, set WSL memory to 4 GB and swap to 4 GB. For 16 GB laptops, set WSL memory to 8 GB and swap to 4 GB. The trainer MUST validate the lite profile on an 8 GB laptop before week 1.
+
+[Doc 06](06-tech-stack-and-setup.md) is authoritative for fixed loopback ports, start/stop, database/topic/seed initialization, JAR caching, storage, and reset. Its RAM totals include all six queries in one driver plus Python/non-heap memory. Trainer pre-check must measure the implemented profile; no application has been run by this spec.
 
 ## Expected student repository tree
 
@@ -174,10 +177,10 @@ vayustream/
     transforms/
     aqi/
     alerts/
+    inspection/
     ops/
   config/
     stations/
-    grafana/
     spark/
   data/
     delta/
@@ -186,6 +189,8 @@ vayustream/
     unit/
     integration/
     e2e/
+    cli/
+    local/
     fixtures/
   docs/
     adr/
@@ -196,13 +201,14 @@ vayustream/
 
 | Principle | VayuStream application |
 |---|---|
-| Medallion architecture | Bronze keeps raw audit data, Silver keeps trusted readings, and Gold serves dashboard tables. |
+| Medallion architecture | Bronze keeps raw audit data, Silver keeps trusted readings, and Gold serves SQL/CLI results and alerts. |
 | Event-time processing | Watermarks and windows use `event_time`, not wall-clock arrival time. |
 | Idempotent sinks | Delta and PostgreSQL use stable keys to survive replay. |
 | At-least-once edges | Kafka and notifications can duplicate messages, so consumers deduplicate by stable IDs. |
 | Pure transformations | Parsing, validation, AQI, and aggregation helpers support small batch DataFrame tests. |
 | 12-factor configuration | Profiles, rates, paths, ports, and credentials come from environment variables. |
-| Local-first operations | The lite stack runs on an 8 GB laptop without cloud services. |
+| Local-first operations | Lite targets an 8 GB/four-core laptop with no UI services, explicit simulator source, cached runtime dependencies, and persisted start/stop state. |
+| Single-driver ownership | Six isolated-checkpoint queries share one SparkSession; alert poller and inspection are Python processes, not additional Spark drivers. |
 
 ## Required ADR topics
 
@@ -212,7 +218,7 @@ vayustream/
 | ADR-002 | Checkpoint and replay strategy | How does each query choose checkpoint paths, and when is checkpoint deletion unsafe? |
 | ADR-003 | PostgreSQL upsert design | Which business keys make station, city, and alert writes idempotent after replay? |
 | ADR-004 | AQI interpretation | How does the project label 15-minute AQI as indicative while using CPCB breakpoints? |
-| ADR-005 | Local hardware profile | Which services are disabled or limited in lite mode to fit 8 GB RAM? |
+| ADR-005 | Local hardware and CLI contract | How do the single driver, proposed all-process budgets, loopback ports, offline fixtures, SELECT-only inspector, and exact output contracts fit the lite target? |
 | ADR-006 | Optional real-data mode | If Open-Meteo is enabled, how are terms, units, polling rate, and failures handled? |
 | ADR-007 | Optional schema evolution | If Avro or object storage is added, which maintained tool is selected and why? |
 

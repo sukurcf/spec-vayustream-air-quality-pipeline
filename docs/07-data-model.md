@@ -7,8 +7,8 @@ Purpose: This document defines VayuStream data contracts, tables, keys, partitio
 | Source | Format | Licence or terms | Size in Must scope | Notes |
 |---|---|---|---|---|
 | Station reference | CSV | Student-created fictional data | 10 rows | Required columns: station ID, city, state, latitude, longitude, installed date. |
-| Sensor simulator | JSON over Kafka | Student-created synthetic data | 10 sensors every 5 seconds | Must pollutants are PM2.5, PM10, and NO2. |
-| Open-Meteo Air Quality API | HTTPS JSON | Free, no key, non-commercial use to be verified before use | 5 city polls per hour in Should scope | Publish with `source=open-meteo`. |
+| Sensor simulator | JSON over Kafka | Student-created synthetic data | 10 sensors every 5 seconds in steady mode | Explicit internet-free default; named 100-event scenario controls event-time batches. Must pollutants are PM2.5, PM10, and NO2. |
+| Open-Meteo Air Quality API | HTTPS JSON | Free, no key, non-commercial use to be verified before use | 5 city polls per hour in Should scope | Explicit optional source; publish with `source=open-meteo`; recorded responses for tests. |
 
 No source contains personal data.
 
@@ -325,6 +325,7 @@ erDiagram
 | `alerts.alert_events` | Unique key on `alert_id`; index on `city`, `status`, and `created_at`. |
 | `alerts.outbox` | Unique key on `outbox_id`; index pending rows by `status` and `created_at`. |
 | `station_reference` | Unique key on `station_id`; active station count must match profile. |
+| Inspection interface | SELECT-only `vayu_inspector` on gold station/city and alert-event tables; validated parameterized filters. JSON/text/CSV field/order contracts are in doc 08, with no raw access or additional storage layer. |
 
 ## Enumerations
 
@@ -378,16 +379,17 @@ erDiagram
 | Silver Delta | Keep for the full 6-week project. |
 | Quarantine | Keep for at least 30 days. |
 | PostgreSQL gold and alerts | Keep for the full 6-week project. |
+| Local seed/demo manifest and output evidence | Persist through stop/start; completed fixture runs are verified, not republished by initialization. |
 
 ## Migration policy
 
-Schema changes MUST increment `schema_version` for event contracts. Additive optional fields MAY be introduced in minor project changes. Required field changes MUST include migration notes and backward-compatibility tests. PostgreSQL changes MUST be described as migrations in the student repository, not as manual database edits.
+Schema changes MUST increment `schema_version` for event contracts. Additive optional fields MAY be introduced in minor project changes. Required field changes MUST include migration notes and backward-compatibility tests. PostgreSQL changes MUST be described as migrations in the student repository, not as manual database edits. Doc 06 initialization applies migrations idempotently without recreating populated tables; stop/start preserves Kafka, Delta/checkpoints, gold, poller state, and outbox data.
 
 ## Data engineering rules
 
 - Bronze is append-only and keeps malformed payloads.
 - Silver is trusted, typed, enriched, and deduplicated.
-- Gold PostgreSQL tables are serving tables for Grafana. `completeness_pct` is rounded to 2 decimals.
+- Gold PostgreSQL tables serve Python inspection/SQL clients. `completeness_pct` remains rounded to 2 decimals; CLI serialization does not change aggregates or AQI.
 - AQI values are nullable when data is insufficient.
 - Alert events are at-least-once externally but idempotent by `alert_id`.
 - Quarantine IDs use Kafka topic, partition, and offset, so retries do not create duplicate rejection rows.
