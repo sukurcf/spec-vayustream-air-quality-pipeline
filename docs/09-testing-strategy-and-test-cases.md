@@ -1,296 +1,35 @@
 # Testing strategy and test cases
 
-Purpose: This document defines how students prove that VayuStream works, handles failures, and meets quality targets.
+## Strategy and gates
 
-## Test strategy
+Use dbt parse/build/test and isolated local PostgreSQL data. Failure-injection cases must not alter the required committed fixture. Restore the clean test database before the demo. All runtime cases use fictional data and pass without external network access after initial downloads.
 
-VayuStream MUST retain at least 45 meaningful tests. Streaming tests MUST control event time and use explicit batch barriers rather than real sleeps. Frontend tests are replaced by Python inspection and local acceptance cases; no console is required for business evidence.
+There are exactly 19 unique acceptance cases below. The clean project defines nine dbt test nodes as listed in doc 08. Any authored Python support package targets at least **80% line coverage and 70% branch coverage**; do not add Python application logic just to create a coverage denominator. dbt SQL is evaluated with the named dbt tests and exact-result cases.
 
-Lite tests MUST reuse one session-scoped SparkSession for batch tests, close it, then run all six application queries in one shared streaming driver. Execute these phases sequentially; do not launch one JVM per test/query or parallel Spark workers that exceed doc 06's proposed budget.
+| ID | Priority | Input and action | Expected result | FR |
+|---|---|---|---|---|
+| TC-DBT-001 | Must | Run `dbt parse` with the local target and valid project configuration. | Parse succeeds; the graph has one `retail` source group, two required staging models, and `mart_sales`. | FR-DBT-01, FR-DBT-02, FR-DBT-03 |
+| TC-DBT-002 | Must | Start with an empty local schema; run `dbt parse`, seed, full-refresh build, and test. | Required source tables and models are created; the clean run succeeds from empty schema. | FR-DBT-01, FR-DBT-02, FR-DBT-03, FR-DBT-04 |
+| TC-DBT-003 | Must | Inspect seeded fixture counts and compare with project caps. | `orders` has 20 rows, `products` has 6 rows; neither exceeds 100/20. | FR-DBT-01 |
+| TC-DBT-004 | Must | Build `stg_orders` from the clean fixture. | 20 rows; dates, integer quantities, exact two-decimal prices, and status values use the documented types/representations. | FR-DBT-02 |
+| TC-DBT-005 | Must | Build `stg_products` from the clean fixture. | 6 rows; product keys, names, and categories are present at product grain. | FR-DBT-02 |
+| TC-DBT-006 | Must | Inspect the clean sales mart by order key. | Exactly 20 rows; `order_id` is unique and non-null. | FR-DBT-03, FR-DBT-04 |
+| TC-DBT-007 | Must | Sum `mart_sales.net_sales` on the clean fixture. | Exact numeric total is `441.00`; 18 orders are `COMPLETE`, 2 are `CANCELLED`. | FR-DBT-03 |
+| TC-DBT-008 | Must | Run `dbt test` on the clean fixture and inspect the test results. | All nine required nodes pass: unique/not-null on the three keys, one relationship, one accepted-values rule, and one singular business check. | FR-DBT-04 |
+| TC-DBT-009 | Must | In an isolated `orders` seed, duplicate one `order_id`; rebuild and test. | The `stg_orders.order_id` unique test fails and reports the duplicate key. | FR-DBT-04 |
+| TC-DBT-010 | Must | In an isolated `orders` seed, set one `order_id` to null; rebuild and test. | The `stg_orders.order_id` not-null test fails. | FR-DBT-04 |
+| TC-DBT-011 | Must | In an isolated `products` seed, duplicate one `product_id`; rebuild and test. | The `stg_products.product_id` unique test fails. | FR-DBT-04 |
+| TC-DBT-012 | Must | In an isolated `products` seed, set one `product_id` to null; rebuild and test. | The `stg_products.product_id` not-null test fails. | FR-DBT-04 |
+| TC-DBT-013 | Must | Set an order's `product_id` to a key absent from `products`; rebuild and test. | The single mart-to-product relationship test fails and identifies the orphan key. | FR-DBT-04 |
+| TC-DBT-014 | Must | Set an order status to `PENDING`; rebuild and test. | The accepted-values test fails; only `COMPLETE` and `CANCELLED` are accepted. | FR-DBT-04 |
+| TC-DBT-015 | Must | In an isolated test database, build the mart, corrupt one completed row's `net_sales`, and run `dbt test`. | The singular business test fails and returns the invalid row. | FR-DBT-04 |
+| TC-DBT-016 | Must | Run the same seed and full-refresh build twice, checking after each run. | Both runs leave 20 mart rows and total `441.00`; no duplicate mart rows accumulate. | FR-DBT-03, FR-DBT-05 |
+| TC-DBT-017 | Must | Stop PostgreSQL, then run a command that needs the database. | dbt exits nonzero with a useful connection error; no fallback source or false success occurs. | FR-DBT-01, FR-DBT-05 |
+| TC-DBT-018 | Must | With dependencies and the image already downloaded, block external network and run the complete demo. | Compose database, seed, build, and tests finish using only local resources. | FR-DBT-05 |
+| TC-DBT-019 | Must | Complete the demo, stop and restart PostgreSQL without deleting its volume, then inspect the mart. | Existing local state remains at 20 rows and `441.00`; a repeat full-refresh build still does not accumulate duplicates. | FR-DBT-05 |
 
-| Level | Approximate count | Scope | Main tools |
-|---|---:|---|---|
-| Unit | 29 | AQI, validation, completeness, alert state, configuration | pytest 9.1.x, coverage 7.16.x |
-| DataFrame transformation | 10 | Small batch Spark DataFrames for Silver and Gold logic | PySpark 4.2.x, chispa 0.12.x |
-| Integration | 9 | Kafka, Delta paths, PostgreSQL upserts, health checks | pytest, Docker Compose v5.x |
-| End-to-end | 6 | Deterministic stream, restart recovery, inspection results, alerts | pytest, Spark checkpoints |
-| Inspection CLI | 6 | Exact JSON/text/CSV, null/empty results, filters, permissions, atomic files | pytest, local PostgreSQL |
-| Local acceptance | 4 | Clean offline start, deterministic operation, persisted restart, clear failures | pytest, single-driver lite stack |
-| Alert poller/outbox | 2 | FINAL-only cursor/streak and publication crash/recovery | pytest, local Kafka/PostgreSQL, fixed clock |
-| Performance and security | 6 | Throughput, latency, Gitleaks, ports, coverage gates | pytest, Gitleaks 8.30.x, Trivy 0.75.x |
+## Coverage and evidence
 
-## Tools and versions
-
-| Tool | Version line | Use |
-|---|---|---|
-| Python | 3.12.x | Application and tests. |
-| uv | 0.12.x | Dependency and lockfile management. |
-| pytest | 9.1.x | Test runner. |
-| pytest-cov and coverage | 7.1.x and 7.16.x | Line and branch coverage. |
-| PySpark | 4.2.x | Batch and streaming tests. |
-| delta-spark | 4.4.x | Delta Lake test tables. |
-| chispa | 0.12.x | Spark DataFrame equality assertions. |
-| Apache Kafka | 4.3.x | Local broker image `apache/kafka:4.3.1`. |
-| PostgreSQL | 18.x | Gold and alert sinks. |
-| Ruff | 0.16.x | Lint and format. |
-| mypy | 2.4.x | Type checks. |
-| Gitleaks | 8.30.x | Secret scanning. |
-| Trivy | 0.75.x | Container and dependency scanning. |
-
-## Test environments
-
-| Environment | Hardware | Purpose |
-|---|---|---|
-| Developer fast path | Any supported laptop | Unit tests and small batch DataFrame tests. |
-| Lite CI | 8 GB reference profile | Required integration, deterministic E2E, and coverage gates. |
-| Standard local | 16 GB profile | Should tests for 50 sensors, machine-readable summaries, Mailpit, and explicitly enabled Open-Meteo. No UI implementation tests. |
-
-Initial dependency/image/JAR preparation and hosted CI require internet. Runtime tests use the simulator and local/recorded fixtures with external network blocked; local service networking is allowed. The trainer MUST measure the implemented lite profile on an 8 GB/four-core host against the proposed budgets before week 1, not claim an already measured fit.
-
-## Test data strategy
-
-| Data set | Source | Exact use |
-|---|---|---|
-| `stations_lite.csv` | Fictional station fixture | 10 stations in Delhi, Mumbai, Bengaluru, Chennai, and Hyderabad. |
-| Duplicate station CSV | Fixture | Two `DEL-001` rows for station uniqueness tests. |
-| `aqi_breakpoints.csv` | Fixture from CPCB values in this spec | AQI boundary-value tests. |
-| Seeded 100-message JSONL | Generated by simulator seed `vayu-lite-001` | Deterministic 100-message E2E test. |
-| Recorded Open-Meteo Delhi JSON | Recorded non-secret response | Should real-data parser test. |
-| `inspection_contract_delhi` | Independent PostgreSQL sink-contract fixture | FINAL Delhi 10:00 row with readings `350/360`, completeness `97.22`, averages `95/260/90`, AQI `215`; exact doc 08 CLI snapshots. Not part of the 100-message stream. |
-| Null-AQI/empty inspection rows | Isolated sink fixtures | Null stays null/blank/`Insufficient data`; known cities with no rows return successful empty results. |
-| FINAL-window alert/outbox fixtures | Fixed event-time and creation-time sequences | Adjacent trigger, cooldown, publication crash, duplicate delivery, and recovery; never inserted into the 100-message demo. |
-
-The deterministic 100-message set MUST use 3 batches. B1 has 86 unique valid readings in 10:00-10:15 UTC, 5 extra duplicate copies, 3 malformed JSON payloads, 2 missing-field payloads, and 1 out-of-range payload. B2 has 1 valid `DEL-001` reading at 10:31 UTC. B3 has 2 new valid event IDs at 10:00 UTC after the watermark is active. Expected counts are Bronze 100, Silver 87, DLQ 6, quarantine 6, duplicate dropped 5, late dropped 2, FINAL station rows 10, FINAL city rows 5, total station rows 11, and total city rows 6.
-
-## Coverage thresholds
-
-| Scope | Line threshold | Branch threshold | Measured packages | Exclusions |
-|---|---:|---:|---|---|
-| Whole project | 80% | 70% | `vayustream` application packages including `inspection` and `ops` | tests, migrations, generated files, `__main__` blocks |
-| AQI module | 100% | 100% | `vayustream.aqi` | none |
-| Transform modules | 85% | 75% | `vayustream.transforms`, `vayustream.streaming` | Spark session fixtures |
-
-CI MUST fail when either line coverage or branch coverage is below its threshold, enforced separately. There is no frontend coverage gate.
-
-## Test case catalog
-
-| ID | Title | Type | Priority | Linked requirement IDs | Preconditions | Steps | Test data | Expected result |
-|---|---|---|---|---|---|---|---|---|
-| TC-UT-001 | PM2.5 Good lower boundary | Unit | Must | FR-AQI-01 | PM2.5 breakpoints are loaded. | Evaluate the lowest PM2.5 breakpoint. | PM2.5 0 µg/m³. | Sub-index is 0 and category is Good. |
-| TC-UT-002 | PM2.5 Good upper boundary | Unit | Must | FR-AQI-01 | PM2.5 Good band is loaded. | Evaluate the upper edge of the Good band. | PM2.5 30 µg/m³. | Sub-index is 50 and category is Good. |
-| TC-UT-003 | PM2.5 Satisfactory lower boundary | Unit | Must | FR-AQI-01 | PM2.5 Satisfactory band is loaded. | Evaluate the first Satisfactory PM2.5 value. | PM2.5 31 µg/m³. | Sub-index is 51 and category is Satisfactory. |
-| TC-UT-004 | PM2.5 Moderate upper boundary | Unit | Must | FR-AQI-01 | PM2.5 Moderate band is loaded. | Evaluate the last Moderate PM2.5 value. | PM2.5 90 µg/m³. | Sub-index is 200 and category is Moderate. |
-| TC-UT-005 | PM10 Poor lower boundary | Unit | Must | FR-AQI-01 | PM10 Poor band is loaded. | Evaluate the first Poor PM10 value. | PM10 251 µg/m³. | Sub-index is 201 and category is Poor. |
-| TC-UT-006 | PM10 Severe start | Unit | Must | FR-AQI-01 | PM10 Severe convention is loaded. | Evaluate the first Severe PM10 value. | PM10 431 µg/m³. | Sub-index is 401 and category is Severe. |
-| TC-UT-007 | NO2 Satisfactory upper boundary | Unit | Must | FR-AQI-01 | NO2 Satisfactory band is loaded. | Evaluate the upper Satisfactory NO2 value. | NO2 80 µg/m³. | Sub-index is 100 and category is Satisfactory. |
-| TC-UT-008 | AQI insufficient pollutants | Unit | Must | FR-AQI-01 | City AQI function available. | Calculate city AQI with only PM10 and NO2. | PM10 120, NO2 70. | `aqi_value` is null and no category is set. |
-| TC-UT-009 | AQI max sub-index wins | Unit | Must | FR-AQI-01 | City AQI function available. | Calculate city AQI with three pollutants. | PM2.5 95, PM10 260, NO2 90. | Sub-indexes are 215, 210, and 110; AQI is 215 and category is Poor. |
-| TC-UT-023 | Decimal truncation before AQI lookup | Unit | Must | FR-AQI-01 | AQI helper is available. | Calculate PM2.5 sub-index for a decimal average. | PM2.5 90.9 µg/m³. | Value truncates to 90; sub-index is 200 and category is Moderate. |
-| TC-UT-024 | CO one-decimal truncation | Unit | Should | FR-DAILY-01 | CO breakpoints are loaded. | Calculate CO sub-index for a decimal average. | CO 2.09 mg/m³. | Value truncates to 2.0; sub-index is 100 and category is Satisfactory. |
-| TC-UT-025 | Severe cap saturation | Unit | Must | FR-AQI-01 | Severe convention is loaded. | Calculate PM2.5 sub-index above the project cap. | PM2.5 500 µg/m³. | Sub-index is capped at 500 and category is Severe. |
-| TC-UT-026 | Zero concentration sub-index | Unit | Must | FR-AQI-01 | AQI helper is available. | Calculate PM10 sub-index at zero concentration. | PM10 0 µg/m³. | PM10 returns 0, and the category remains Good. |
-| TC-UT-027 | Should pollutant boundaries | Unit | Should | FR-DAILY-01 | Full pollutant breakpoints are loaded. | Evaluate SO2, O3, and NH3 upper Good boundaries. | SO2 40, O3 50, NH3 200. | Each sub-index is 50 and category is Good. |
-| TC-UT-028 | O3 daily basis switch | Unit | Should | FR-DAILY-01 | Daily AQI rules are loaded. | Evaluate daily O3 case A and case B. | Case A: 8-hour 190 and 1-hour 260. Case B: 8-hour 230 and 1-hour 400. | Case A uses 8-hour basis with sub-index 254. Case B uses 1-hour basis with sub-index 336. |
-| TC-UT-010 | Completeness full station window | Unit | Must | FR-GLD-01 | Completeness helper available. | Calculate station completeness for 180 readings. | Unique readings 180, expected 180. | Completeness is 100.00%. |
-| TC-UT-011 | Completeness partial city window | Unit | Must | FR-GLD-01 | Completeness helper available. | Calculate city completeness for 2 sensors and 350 readings. | Unique readings 350, expected 360. | Completeness is 97.22%. |
-| TC-UT-012 | Alert threshold second window | Unit | Must | FR-ALT-01 | Alert state helper available. | Feed Delhi Poor at 10:00 and Poor at 10:15. | AQI 225 and 240. | One unhealthy alert is created for window 10:15. |
-| TC-UT-013 | Alert cooldown suppresses duplicate | Unit | Must | FR-ALT-01 | Existing Delhi Poor alert created at 10:30:15. | Feed Delhi Poor at 10:30 and 10:45. | AQI 245 and 250. | No new Poor alert is created before 11:30:15. |
-| TC-UT-014 | Recovery at threshold | Unit | Must | FR-ALT-02 | Mumbai has active Very Poor alert. | Feed Mumbai AQI 200 window. | AQI 200. | One recovery alert is created. |
-| TC-UT-015 | Recovery blocked above threshold | Unit | Must | FR-ALT-02 | Mumbai has active Very Poor alert. | Feed Mumbai AQI 201 window. | AQI 201. | No recovery alert is created. |
-| TC-UT-029 | Alert gap starts new streak | Unit | Must | FR-ALT-01 | Alert state helper is available. | Feed Poor at 10:00, no 10:15 window, Poor at 10:30, and Poor at 10:45. | Delhi AQI 225, gap, 230, 235. | The 10:30 window starts a new WATCHING streak; the 10:45 window creates one alert. |
-| TC-UT-016 | Lite station count accepted | Unit | Must | FR-SIM-01 | Lite station fixture is present. | Load lite station CSV. | 10 station rows in 5 cities. | Loader returns 10 active stations and 5 distinct cities. |
-| TC-UT-017 | Lite station count rejected | Unit | Must | FR-SIM-01 | Invalid station-count fixture is present. | Load invalid lite station CSV. | 9 station rows. | Startup fails with error `station-count-invalid`. |
-| TC-UT-018 | Station latitude rejected | Unit | Must | FR-SIM-01 | Location validator is enabled. | Load station with latitude 91.0. | `DEL-999`, latitude 91.0. | Loader rejects row with error `station-location-out-of-range`. |
-| TC-UT-019 | Deterministic seed repeats | Unit | Must | FR-SIM-02 | Simulator seed function available. | Generate 100 events twice with same seed. | Seed `vayu-lite-001`. | Both runs have identical event IDs and timestamps. |
-| TC-UT-020 | Unknown fault type rejected | Unit | Must | FR-SIM-02 | Fault configuration parser available. | Parse config with unsupported fault. | `fault_type=spike_magic`. | Startup stops with error `fault-type-unsupported`. |
-| TC-UT-021 | Producer missing field marked as fault | Unit | Must | FR-SIM-03 | Producer serializer available. | Serialize event without `pm25_ugm3`. | Event `evt-missing-pm25`. | Event is tagged as `missing-field` fault, not valid. |
-| TC-UT-022 | Raw key equals station ID | Unit | Must | FR-SIM-03 | Producer record builder available. | Build Kafka record from valid event. | Station `DEL-001`. | Kafka key is `DEL-001` and event ID is unchanged. |
-| TC-DQ-001 | Malformed JSON to quarantine | Data quality | Must | FR-SLV-01 | Silver parser available. | Parse malformed payload. | Truncated JSON for `evt-bad-001`. | No Silver row; one quarantine row has `malformed-json`. |
-| TC-DQ-002 | Missing station to unknown DLQ key | Data quality | Must | FR-SLV-02 | Silver validator available. | Validate JSON without `station_id`. | Event `evt-no-station`. | DLQ key is `unknown` and reason is `required-field-missing`. |
-| TC-DQ-003 | Negative pollutant rejected | Data quality | Must | FR-SLV-01 | Silver validator available. | Validate event with negative NO2. | `no2_ugm3=-1`. | Event is rejected with reason `pollutant-out-of-range`. |
-| TC-DQ-004 | Unknown station rejected | Data quality | Must | FR-SLV-04 | Station reference loaded. | Enrich event with missing station ID. | `station_id=BAD-404`. | Event is quarantined with reason `station-not-found`. |
-| TC-DQ-005 | Duplicate station reference rejected | Data quality | Must | FR-SLV-04 | Duplicate-station fixture is present. | Load station reference with duplicate key. | Two `DEL-001` rows. | Stream startup fails with error `station-id-not-unique`. |
-| TC-DF-001 | Silver enriches valid reading | DataFrame | Must | FR-SLV-04 | Small Spark session and station fixture loaded. | Transform one valid Delhi event. | `DEL-001`, PM2.5 42.5, PM10 88.2, NO2 34.0. | Output row includes city Delhi, state Delhi, latitude 28.6139, longitude 77.2090, and installed date 2026-01-10. |
-| TC-DF-002 | Silver drops duplicate event ID | Integration | Must | FR-SLV-03 | Streaming harness has explicit batch barriers. | Process 2 valid events with the same `event_id` inside the watermark. | `evt-dupe-001` appears twice in one micro-batch. | One Silver row remains; the Spark operator duplicate-drop metric and exported `duplicate_events_dropped` metric both equal 1. |
-| TC-DF-003 | Silver counts late event | Integration | Must | FR-SLV-03 | Streaming harness has explicit batch barriers. | Process B1, process B2 at 10:31, wait for watermark 10:16 to become active, then process a 10:00 event. | New valid event ID with event time 10:00. | No Silver row; `late_events_dropped` increases by 1. |
-| TC-DF-004 | Station window metrics | DataFrame | Must | FR-GLD-01 | Three `DEL-001` Silver rows are available. | Aggregate one station window. | 3 readings for `DEL-001` at 10:00, 10:05, 10:10. | One station window row has count 3 and window start 10:00. |
-| TC-DF-005 | City window metrics | DataFrame | Must | FR-GLD-01 | Delhi Silver rows for 2 stations are available. | Aggregate Delhi city window. | `DEL-001` and `DEL-002` readings in same window. | One city window row has city Delhi and active sensor count 2. |
-| TC-DF-009 | City pollutant min and max | DataFrame | Must | FR-GLD-01 | Delhi Silver rows include different pollutant values. | Aggregate Delhi city window with two readings. | PM2.5 values 40 and 55, PM10 values 80 and 100, NO2 values 20 and 30. | City row has PM2.5 min 40 max 55, PM10 min 80 max 100, and NO2 min 20 max 30. |
-| TC-DF-006 | Gold duplicate does not increase count | DataFrame | Must | FR-GLD-01 | Gold transform available. | Aggregate input that contains duplicate event ID. | Two rows for `evt-dupe-009`. | `reading_count` counts the event once. |
-| TC-DF-007 | AQI null is preserved | DataFrame | Must | FR-AQI-01 | City AQI transform available. | Build AQI from city window with two pollutants. | Delhi PM10 100 and NO2 80 only. | `aqi_value` is null and not 0. |
-| TC-DF-008 | Quarantine reason required | DataFrame | Must | FR-SLV-02 | Quarantine quality check available. | Validate quarantine DataFrame without reason. | Row has null `reason_code`. | Check reports `quarantine-reason-required`. |
-| TC-IT-001 | Required Kafka topics exist | Integration | Must | FR-KAF-01 | Kafka broker is running. | Run topic health check. | Required topic list. | `vayu.readings.raw`, `vayu.readings.dlq`, and `vayu.alerts` exist. |
-| TC-IT-002 | Raw retention minimum | Integration | Must | FR-KAF-01 | Kafka broker is running. | Read raw topic configuration. | `vayu.readings.raw`. | Retention is at least 7 days. |
-| TC-IT-003 | Missing topic health failure | Integration | Must | FR-KAF-01 | Kafka broker is running without raw topic. | Run health check. | Topic name `vayu.readings.raw`. | Health status is `unhealthy` and reason is `topic-missing`. |
-| TC-IT-004 | Bronze appends duplicate events | Integration | Must | FR-BRZ-01 | Bronze query test harness available. | Process 2 raw messages with same event ID. | Two payloads with `evt-dupe-010`. | Bronze has 2 rows with different offsets. |
-| TC-IT-005 | Bronze partition field required | Integration | Must | FR-BRZ-01 | Bronze quality check available. | Validate Bronze row missing `ingest_date`. | One Bronze row with null `ingest_date`. | Check reports `bronze-partition-missing`. |
-| TC-IT-006 | PostgreSQL city upsert is idempotent | Integration | Must | FR-GLD-02 | PostgreSQL test database running. | Write same Delhi city window twice. | City Delhi, window start 10:00. | `gold.city_window_aqi` has exactly 1 row for the key. |
-| TC-IT-007 | PostgreSQL station upsert is idempotent | Integration | Must | FR-GLD-02 | PostgreSQL test database running. | Write same station window twice. | Station `DEL-001`, window start 10:15. | `gold.station_window_metrics` has exactly 1 row for the key. |
-| TC-IT-008 | Incomplete gold key rejected | Integration | Must | FR-GLD-02 | PostgreSQL sink validator available. | Attempt upsert without `window_start`. | City Delhi with null window start. | Sink rejects row with error `gold-key-incomplete`. |
-| TC-IT-009 | Silver sink replay after partial write | Integration | Must | FR-SLV-02 | Failure injection enabled in `foreachBatch`. | Crash after Silver Delta write and before quarantine and DLQ writes, then replay the batch. | Batch has one valid and one malformed event. | Silver row is not duplicated; quarantine has one row; DLQ may republish with stable source metadata. |
-| TC-E2E-001 | Deterministic stream counts | End-to-end | Must | FR-TEST-01 | Isolated checkpoints and empty sinks. | Process B1, process B2, wait for active watermark, then process B3. | B1 97 records, B2 one 10:31 reading, B3 two late 10:00 readings. | Bronze 100, Silver 87, DLQ 6, quarantine 6, duplicate dropped 5, late dropped 2. |
-| TC-E2E-002 | Deterministic gold row counts | End-to-end | Must | FR-GLD-01 | TC-E2E-001 data loaded. | Query FINAL and PROVISIONAL Gold rows after B2. | Same deterministic run. | FINAL 10:00 rows are 10 station and 5 city; total rows are 11 station and 6 city. |
-| TC-E2E-003 | Restart after sink write replay | End-to-end | Must | FR-OPS-01 | Failure injection enabled. | Fail after PostgreSQL sink write and before checkpoint commit, then restart. | Batch with Delhi 10:00 city window. | Row count remains 1 and no committed Kafka data is lost. |
-| TC-E2E-004 | Four-command Python inspection data | End-to-end | Must | Serving-data semantics: FR-CLI-01, BR-23, NFR-USE-02 | Independent PostgreSQL inspection/alert fixtures are loaded. | Run current, windows, completeness, and alerts in JSON/text/CSV. | Delhi AQI 250/Poor, null-AQI row, PROVISIONAL/FINAL windows, and one stable alert ID. | All 12 results preserve doc 08 columns/order, CPCB category, indicative basis, window status, completeness, and alert history without a console; null is never zero. |
-| TC-E2E-005 | Repeated local start is idempotent | End-to-end | Must | FR-OPS-02, NFR-USE-01 | Initial downloads/JARs cached; isolated lite storage. | Run doc 06 start twice and inspect health/initialization state. | 8 GB/four-core profile, 10 stations. | First start is healthy within 5 minutes; second start retains cluster ID/topics/migration state, exactly one Spark driver with six queries, and no duplicate seed rows or republished events. |
-| TC-E2E-006 | Runbook restart preserves checkpoint | End-to-end | Must | FR-OPS-03 | Silver query stopped after offset 50. | Follow restart procedure with same checkpoint. | Raw offsets 51 to 60 pending. | Query processes offset 51 or replayed uncommitted batch without skipping data. |
-| TC-SEC-001 | Secret scan blocks committed password | Security | Must | NFR-SEC-01 | Gitleaks configured. | Scan fixture branch with fake password. | `POSTGRES_PASSWORD=not-a-real-secret-123`. | Security job fails and reports a secret finding. |
-| TC-SEC-002 | Fixed loopback ports only | Security | Must | NFR-SEC-02 | Lite stack configuration available. | Review published bindings and Kafka advertised listeners. | Host ports `19092` and `15433`. | Both publish only on `127.0.0.1`; controller/bridge broker/driver ports are not published; no UI service starts. Host/container bootstrap addresses match doc 06. |
-| TC-SEC-003 | No personal data in fixtures | Security | Must | NFR-PRIV-01 | Fixture files available. | Scan station and event fixtures. | Lite station CSV and JSONL events. | No real names, phone numbers, or personal e-mail addresses appear. |
-| TC-INFRA-001 | Lite rejects UI services and extra drivers | Infrastructure | Must | FR-OPS-02, BR-25 | Lite profile selected. | Validate service/process plan with an added UI service, then with six separate Spark drivers. | Two invalid lite configurations. | Exit is `2` with `lite-service-disabled` or `lite-driver-count-invalid`; valid configuration has one broker, one driver/SparkSession, six query checkpoints, and proposed 2048 MiB/1280m Spark budget including Python workers. |
-| TC-INFRA-002 | Checkpoint paths are isolated | Infrastructure | Must | FR-OPS-01 | Query configuration available. | Validate checkpoint paths for 6 Spark queries. | Bronze, Silver, 2 Gold station queries, and 2 Gold city queries. | Each Spark query has a unique checkpoint path. |
-| TC-PERF-001 | Producer lite throughput | Performance | Must | FR-SIM-03 | Kafka broker is healthy. | Run producer for 10 minutes. | 10 sensors, 5-second interval. | Producer sustains 2 readings/sec with zero unhandled send errors. |
-| TC-PERF-002 | Lite inspectable-gold latency | Performance | Must | FR-CLI-01, NFR-PERF-01 | Lite steady simulator runs for 15 minutes in an isolated trial. | Compare Kafka ingest timestamps with queryable PROVISIONAL PostgreSQL time using CLI/SQL. | 10 sensors, no external source. | p95 latency is 120 seconds or less; FINAL completion is judged by watermark, not this timing target. |
-| TC-PERF-003 | Standard profile throughput | Performance | Should | NFR-PERF-03 | 16 GB profile available. | Run standard profile for 15 minutes. | 50 sensors, 5-second interval. | Pipeline sustains 10 readings/sec without query failure. |
-| TC-OBS-001 | Micro-batch metrics logged | Observability | Must | NFR-OBS-01 | Streaming query runs one batch. | Inspect structured log for batch ID 7. | Batch with 12 input rows and 10 output rows. | Log has query name, batch ID, input count, output count, and error count. |
-| TC-OBS-002 | Consumer lag logged | Observability | Should | NFR-OBS-02 | Standard profile enabled. | Inspect operations log after 5 minutes. | Raw topic consumer group. | Consumer lag and streaming progress appear in logs. |
-| TC-MAINT-001 | Ruff and mypy pass | Static | Must | FR-TEST-01 | Application package exists. | Run lint and type-check jobs. | Current source tree. | Ruff and mypy both exit successfully. |
-| TC-MAINT-002 | Pure batch transform test | Unit | Must | FR-TEST-01 | Transform functions are importable. | Call Silver validation function with small batch DataFrame. | 2 valid rows and 1 invalid row. | Function returns 2 valid rows and 1 invalid row without streaming context. |
-| TC-COV-001 | Coverage line gate fails | Static | Must | FR-TEST-01 | Coverage report generated. | Evaluate report with 79.9% line coverage. | Line 79.9%, branch 75%. | CI fails because line coverage is below 80%. |
-| TC-COV-002 | Coverage branch gate fails | Static | Must | FR-TEST-01 | Coverage report generated. | Evaluate report with 69.9% branch coverage. | Line 85%, branch 69.9%. | CI fails because branch coverage is below 70%. |
-| TC-SHOULD-001 | Open-Meteo hourly poll | Integration | Should | FR-REAL-01 | Recorded response fixture available. | Run one Open-Meteo poll for 5 cities. | Delhi, Mumbai, Bengaluru, Chennai, Hyderabad. | Five batches are published with `source=open-meteo`. |
-| TC-SHOULD-002 | Open-Meteo failure isolated | Integration | Should | FR-REAL-01 | Open-Meteo client returns 503. | Run hourly poll. | HTTP 503 fixture. | Log contains `open-meteo-unavailable` and simulator mode continues. |
-| TC-SHOULD-003 | Extended inspection summary preserves stored metrics | CLI | Should | FR-CLI-02, BR-29 | Stored station-window fixture exists. | Run summary in all formats for a 70% row, then a 90% row. | PM2.5 min/max `40/55`, completeness `70.00` and `90.00`. | Stored min/max are unchanged; `needs_review` is true only for the 70% row under the strict 90% threshold, with no new AQI arithmetic or UI. |
-| TC-SHOULD-004 | Daily AQI CO rule | DataFrame | Should | FR-DAILY-01 | Daily batch transform available. | Calculate daily AQI for CO. | 24 hourly CO values with max 8-hour average 2.1 mg/m³. | Daily row uses max 8-hour CO average, not 24-hour CO average. |
-| TC-SHOULD-005 | Delta maintenance retention safe | Integration | Should | FR-MAINT-01 | Delta table and active checkpoint exist. | Run maintenance dry-run. | Silver table with active checkpoint. | Maintenance does not delete files needed by active checkpoints. |
-| TC-CLI-001 | Current JSON/CSV exact contract | CLI | Must | Byte-level format fidelity: FR-CLI-01, BR-23, NFR-USE-02 | `inspection_contract_delhi` exists in an isolated database. | Export FINAL Delhi current row in JSON/CSV; compare exact bytes to doc 08. | AQI `215`, completeness `97.22`, window 10:00-10:15 UTC. | Both payloads exactly match doc 08, including ordered fields, integer AQI, decimal string `97.22`, UTC `Z`, FINAL status, indicative basis, and trailing LF. |
-| TC-CLI-002 | Null AQI is not zero | CLI | Must | FR-CLI-01, NFR-USE-02 | Isolated row has null AQI/category and stored indicative basis. | Inspect current in all formats. | Fewer-than-three-pollutant sink fixture. | JSON fields remain null, CSV AQI/category cells are empty, and text contains `Insufficient data`; no format substitutes `0` or changes window status. |
-| TC-CLI-003 | Empty results are successful | CLI | Must | FR-CLI-01, NFR-USE-02 | Configured city Chennai has no stored rows in the inspection fixture. | Inspect Chennai current in each format. | Known city with empty result. | JSON is exactly `{"command":"current","row_count":0,"rows":[]}` plus LF; CSV/text follow doc 08's header-only rules, exit `0`, with empty stderr. |
-| TC-CLI-004 | Invalid filters do not execute SQL | CLI | Must | FR-CLI-01, NFR-SEC-03 | SQL calls are instrumented. | Try unknown city/station, `--limit 0`, unsupported format/status, reversed time bounds, and an SQL-fragment city value. | Invalid argument cases. | Every request exits `2` with stderr `cli-invalid-argument`, empty stdout, and 0 SQL calls; no secrets or stack trace appear. |
-| TC-CLI-005 | Inspector is SELECT-only | Integration | Must | FR-CLI-01, NFR-SEC-03 | `vayu_inspector` is provisioned. | Select gold and alert rows; attempt writes and raw-schema reads. | Restricted connection. | Serving-table reads succeed; INSERT/UPDATE/DELETE and raw access fail with insufficient privilege, with no mutation of keys/status/alerts. |
-| TC-CLI-006 | Atomic file export fails safely | CLI | Must | FR-CLI-01, NFR-USE-02 | Existing CSV has known bytes and destination is made unwritable. | Export current result to that file. | Unwritable destination: `--output reports/current.csv`. | Exit is `4`, stderr ID is `inspection-output-failed`, previous file bytes are unchanged, and stdout has no partial data. |
-| TC-ALT-001 | Poller processes FINAL adjacent windows only | Integration | Must | FR-ALT-01, BR-20, BR-21 | Isolated fixed-window fixture and persisted cursor; poller clock is controlled. | Feed FINAL Poor 10:00 and PROVISIONAL Poor 10:15; then finalize 10:15 and replay the cursor. | Delhi AQI `225/245`, 15-minute adjacency. | No alert before the second FINAL row; afterward one stable unhealthy alert/outbox row exists. Replaying creates no second alert and retains the original cooldown/cursor state. |
-| TC-ALT-002 | Outbox crash recovery and recovery-alert dedupe | Integration | Must | Publication/recovery safety: FR-ALT-01, FR-ALT-02, FR-KAF-02, FR-OPS-01 | Separate alert fixture, local Kafka/PG, fixed clock `10:30:15Z`. | In separate trials crash after pending insert and after Kafka publish before marking published; restart poller, then feed FINAL AQI `200` and replay. | Stable `alt-delhi-poor-20261002T101500Z`, cooldown `11:30:15Z`. | Pending publication is not lost; Kafka may duplicate but consumers store one incident by ID. Original creation/cooldown survives; exactly one stable recovery event/incident is added at AQI `200`. |
-| TC-LOCAL-001 | Clean-clone offline local startup | Local acceptance | Must | Offline bootstrap/profile: FR-OPS-02, BR-25, NFR-USE-01, NFR-PORT-01 | Clean clone, initial locked installs/images/JARs cached, isolated empty project storage. | Block external runtime network; capture stdout and exit code from doc 06 lite start; run JSON health. | Default simulator, 10 station seed. | Migrations/topics/users initialize; start exits `0` within 5 minutes; start stdout and health output each match doc 06's exact healthy JSON; bindings are `127.0.0.1:19092/15433`, one broker/driver hosts six queries, and no UI or remote API starts. |
-| TC-LOCAL-002 | Deterministic offline stream and inspection | Local acceptance | Must | Seeded streaming core: FR-OPS-02, FR-SIM-02, FR-TEST-01, FR-CLI-01, NFR-PORT-01 | Lite stack healthy, isolated fixture workspace, external network blocked. | Run `demo --fixture vayu-lite-001`; inspect all four commands with window/completeness limit 100. | Exact B1/B2/B3 schedule. | Demo JSON exactly matches doc 06: Bronze/Silver `100/87`, DLQ/quarantine `6/6`, duplicate/late drops `5/2`, FINAL station/city `10/5`, total station/city `11/6`, alerts `0`; current/windows/station-completeness/alerts row counts are `5/6/11/0`, with 0 external requests. |
-| TC-LOCAL-003 | Stop/start preserves stream and alert state | Local acceptance | Must | Offset/key/state persistence: FR-OPS-01, FR-OPS-02, NFR-REL-01, NFR-REL-02, NFR-PORT-01 | Seed demo completed; separate alert/outbox fixture is tested in its own isolated trial. | Snapshot offsets, keys/status, checkpoints, cursor/cooldown/outbox; stop then start; compare before new input. | Project volumes and bind mounts. | Seed is not republished; stream counts stay `100/87/6/6` and gold totals `11/6`; committed offsets/checkpoints and existing poller/outbox/cooldown state survive. Replayed batches do not add duplicate business keys or overwrite FINAL with PROVISIONAL. |
-| TC-LOCAL-004 | Invalid input and dependency failures are clear | Local acceptance | Must | Non-destructive failure contract: FR-OPS-02, FR-CLI-01, BR-25, NFR-PORT-01 | Isolated local failure profile; persisted data already exists. | Try invalid profile/filter, unavailable Docker, stopped Kafka/PG, and reset without confirmation. | Local dependency failures, profile `unknown`. | Invalid profile/filter/reset exits `2` with `profile-unsupported`/`cli-invalid-argument`/`reset-confirmation-required`; dependencies exit `3` with `docker-unavailable`/`kafka-unavailable`/`postgres-unavailable`. No simulator sends on failed Kafka health, partial output, secret leak, or data deletion occurs. |
-
-## Traceability matrix
-
-| Requirement ID | Test cases or demo step |
-|---|---|
-| FR-SIM-01 | TC-UT-016 |
-| FR-SIM-02 | TC-E2E-001 |
-| FR-SIM-03 | TC-PERF-001 |
-| FR-KAF-01 | TC-IT-001 |
-| FR-KAF-02 | TC-UT-022, TC-E2E-003 |
-| FR-BRZ-01 | TC-IT-004 |
-| FR-SLV-01 | TC-DQ-001 |
-| FR-SLV-02 | TC-DQ-002 |
-| FR-SLV-03 | TC-DF-003 |
-| FR-SLV-04 | TC-DF-001 |
-| FR-GLD-01 | TC-E2E-002 |
-| FR-AQI-01 | TC-UT-009 |
-| FR-GLD-02 | TC-IT-006 |
-| FR-ALT-01 | Trigger/cooldown/cursor/publication evidence: TC-UT-012, TC-UT-013, TC-UT-029, TC-ALT-001, TC-ALT-002 |
-| FR-ALT-02 | Recovery-threshold and replay evidence: TC-UT-014, TC-UT-015, TC-ALT-002 |
-| FR-CLI-01 | TC-E2E-004, TC-CLI-001 through TC-CLI-006, TC-LOCAL-002, TC-LOCAL-004 |
-| FR-OPS-01 | TC-E2E-003 |
-| FR-OPS-02 | TC-E2E-005, TC-INFRA-001, TC-LOCAL-001 through TC-LOCAL-004 |
-| FR-OPS-03 | TC-E2E-006 and runbook demo. |
-| FR-TEST-01 | TC-COV-001, TC-COV-002, TC-E2E-001, local/inspection CI gates, minimum-45 catalog verification. |
-| FR-REAL-01 | TC-SHOULD-001 |
-| FR-CLI-02 | TC-SHOULD-003 |
-| FR-DAILY-01 | TC-SHOULD-004 |
-| FR-MAINT-01 | TC-SHOULD-005 |
-| FR-STR-01 | ADR review demo for BR-32 before any Could work. |
-
-## Business rule verification
-
-| BR ID | Evidence |
-|---|---|
-| BR-01 | TC-UT-016 |
-| BR-02 | TC-PERF-001 |
-| BR-03 | TC-E2E-001 |
-| BR-04 | TC-UT-019 |
-| BR-05 | TC-UT-022 |
-| BR-06 | Shutdown demo and TC-PERF-001 log review. |
-| BR-07 | TC-IT-002 |
-| BR-08 | TC-E2E-003, TC-ALT-002 and alert consumer dedupe demo. |
-| BR-09 | TC-IT-004 |
-| BR-10 | TC-DF-001 |
-| BR-11 | TC-DQ-003 |
-| BR-12 | TC-DQ-001 |
-| BR-13 | TC-DF-003 |
-| BR-14 | TC-DQ-005 |
-| BR-15 | TC-DF-004 |
-| BR-16 | TC-UT-011 |
-| BR-17 | TC-UT-008 |
-| BR-18 | TC-UT-009 |
-| BR-19 | TC-IT-007 |
-| BR-20 | TC-UT-012, TC-ALT-001 |
-| BR-21 | Original cooldown preservation: TC-UT-013, TC-ALT-001, TC-ALT-002 |
-| BR-22 | TC-UT-014, TC-ALT-002 |
-| BR-23 | TC-E2E-004, TC-CLI-001 through TC-CLI-004, TC-LOCAL-002 |
-| BR-24 | TC-INFRA-002 |
-| BR-25 | TC-INFRA-001, TC-LOCAL-001 through TC-LOCAL-004 |
-| BR-26 | TC-E2E-006 |
-| BR-27 | TC-COV-002 |
-| BR-28 | TC-SHOULD-001 |
-| BR-29 | TC-SHOULD-003 |
-| BR-30 | TC-SHOULD-004 |
-| BR-31 | TC-PERF-003 |
-| BR-32 | ADR review demo before Could implementation. |
-
-## NFR verification
-
-| NFR ID | Evidence |
-|---|---|
-| NFR-PERF-01 | TC-PERF-002 |
-| NFR-PERF-02 | TC-PERF-001 |
-| NFR-PERF-03 | TC-PERF-003 |
-| NFR-SCALE-01 | TC-E2E-005 |
-| NFR-SCALE-02 | TC-PERF-003 |
-| NFR-REL-01 | TC-E2E-003 |
-| NFR-REL-02 | TC-IT-006 |
-| NFR-SEC-01 | TC-SEC-001 |
-| NFR-SEC-02 | TC-SEC-002 |
-| NFR-SEC-03 | TC-CLI-004, TC-CLI-005 |
-| NFR-PRIV-01 | TC-SEC-003 |
-| NFR-MAINT-01 | TC-MAINT-001 |
-| NFR-MAINT-02 | TC-MAINT-002 |
-| NFR-OBS-01 | TC-OBS-001 |
-| NFR-OBS-02 | TC-OBS-002 |
-| NFR-USE-01 | TC-E2E-005, TC-LOCAL-001 |
-| NFR-USE-02 | TC-E2E-004, TC-CLI-001 through TC-CLI-004 |
-| NFR-PORT-01 | TC-LOCAL-001 through TC-LOCAL-004 and trainer platform pre-check with measured RAM evidence against proposed budgets. |
-| NFR-LIC-01 | Document 06 licence table review for mandatory tools. |
-| NFR-TEST-01 | TC-COV-001 |
-| NFR-TEST-02 | TC-UT-001 |
-
-## Performance-test conditions
-
-| Condition | Lite value | Standard value |
-|---|---|---|
-| Reference hardware | 8 GB RAM laptop, WSL2 memory 4 GB and swap 4 GB on Windows | 16 GB RAM laptop, WSL2 memory 8 GB and swap 4 GB on Windows |
-| Data volume | 10 sensors for 15 minutes | 50 sensors for 15 minutes |
-| Event rate | 2 readings per second | 10 readings per second |
-| Warm-up | First 2 minutes ignored for latency | First 3 minutes ignored for latency |
-| Duration | 15 minutes for latency; 10 minutes for producer throughput | 15 minutes |
-| Success | p95 latency 120 seconds or less; zero unhandled send errors | No query failure and sustained 10 readings/sec |
-
-## Defect report fields
-
-Each defect report MUST include defect ID, title, environment, profile, requirement ID, test case ID, severity, steps, exact input, expected/actual results, CLI/SQL output and logs, owner, status, root cause, fix PR, and retest evidence. No UI screenshot is required.
-
-## Entry criteria
-
-- The lite stack starts from a clean clone.
-- Required topics, tables, checkpoints, and station fixtures exist.
-- Tests can create isolated checkpoint and Delta directories.
-- The deterministic seed file is reproducible.
-- CI has lint, type check, test, coverage, and security jobs.
-
-## Exit criteria
-
-- All Must test cases pass.
-- Line coverage is at least 80% and branch coverage is at least 70%.
-- AQI module branch coverage is 100%.
-- Deterministic E2E counts match exactly.
-- Restart-recovery test proves idempotent PostgreSQL upserts.
-- No high-severity security findings remain open.
-- The trainer can run the lite demo on an 8 GB laptop.
-- At least 45 meaningful tests remain; TC-LOCAL-001 through TC-LOCAL-004 and all four-command JSON/text/CSV snapshots pass without external runtime network or console interaction.
+For any project-owned Python helper package, report line and branch coverage separately and meet the 80%/70% thresholds. SQL transformations do not count as Python coverage; their evidence is the model-test results, `20` mart rows, and `441.00` total. CI and the trainer review the test outputs and exact result table, not an application screenshot.
 
 [Back to README](../README.md)
